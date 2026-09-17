@@ -212,6 +212,20 @@ impl PendingEndpointActivation {
         }
     }
 
+    /// True only when the activation is past its coherent presentation commit and staying on
+    /// the target: pane input may flow to the committed lease between that commit and the
+    /// presentation-effects fence completion. False for pre-commit phases and for rollback
+    /// synchronization whose completion restores the source, which must keep pane input
+    /// parked until the activation retires.
+    pub(crate) fn committed_to_target(&self) -> bool {
+        matches!(
+            &self.phase,
+            ActivationPhase::SynchronizingPresentation { completion, .. }
+                | ActivationPhase::AwaitingPresentationEffects { completion, .. }
+                if matches!(completion.as_ref(), ActivationCompletion::Activated)
+        )
+    }
+
     /// The complete source command lane cannot safely cross source-off into a later presentation
     /// epoch. Other endpoint lanes are not part of this retirement.
     pub(crate) fn source_command_lane(&self) -> Option<&ClientEndpointId> {

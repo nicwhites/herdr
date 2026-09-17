@@ -393,9 +393,19 @@ pub(super) fn complete_endpoint_activation(
                 state.retire_endpoint_graphics(previous);
             }
         }
-        // The coherent target frame can replace the frozen source now, but the registry keeps
-        // pane input disabled until a second projection epoch has replayed host modes/effects.
+        // The coherent target frame replaces the frozen source, so pane input resumes at this
+        // commit and flows to the proven target. The presentation-effects fence only replays
+        // host input modes (mouse capture, keyboard reporting) afterwards and must tolerate
+        // interleaved keystrokes. Unfreeze only when committed to the target; rollback
+        // synchronization stays frozen so endpoint commands keep failing fast until the
+        // source restoration fully completes below.
         state.unfreeze_presentation();
+        if pending
+            .as_ref()
+            .is_some_and(endpoint::PendingEndpointActivation::committed_to_target)
+        {
+            endpoints.unfreeze_input();
+        }
         let (cleanup, frame) = {
             let shell = state.shell.as_mut().expect("checked client shell");
             (
@@ -784,8 +794,21 @@ pub(super) fn finish_client_shell_input(
             continue;
         }
         if pending_activation.is_some() {
-            // Pane input and non-focus host effects do not cross the frozen handoff boundary.
-            continue;
+            // Non-focus host effects do not cross the frozen handoff boundary. Pane input may
+            // cross once the coherent commit has proven the target safe, so typing resumes
+            // while the presentation-effects fence is still replaying host modes.
+            let pane_input = matches!(
+                request,
+                ClientMessage::ClientShellPaneInput { .. }
+                    | ClientMessage::ClientShellPopupInput { .. }
+            );
+            if !pane_input
+                || !pending_activation
+                    .as_ref()
+                    .is_some_and(endpoint::PendingEndpointActivation::committed_to_target)
+            {
+                continue;
+            }
         }
         write_to_server(endpoints, &request).map_err(ClientError::ConnectionLost)?;
     }

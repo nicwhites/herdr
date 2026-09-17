@@ -713,7 +713,7 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
     ));
     assert!(
         !endpoints.active_surface_available(),
-        "target input remains fenced while presentation effects resynchronize"
+        "the raw machine keeps the registry frozen; the runtime opens pane input at the coherent commit while the fence only replays host modes"
     );
 
     let sync_request = target_sent
@@ -827,6 +827,8 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
         activation.complete(&mut shell, &mut endpoints),
         Ok(crate::client::endpoint::ActivationCompletion::Activated)
     );
+    // The raw machine leaves the registry frozen; the runtime itself unfreezes input at the
+    // coherent commit, so this manual unfreeze only models the end of the fence here.
     endpoints.unfreeze_input();
     assert_eq!(endpoints.active_id(), &target_id);
     assert!(endpoints.active_surface_available());
