@@ -657,7 +657,8 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
             &source_release_data,
             &mut endpoints,
         ),
-        crate::client::endpoint::SurfaceActivationProgress::Pending
+        crate::client::endpoint::SurfaceActivationProgress::Stale,
+        "the source release ack is fire-and-forget; the target-on was already pipelined"
     );
 
     dispatch_lifecycle_messages(

@@ -1152,7 +1152,6 @@ async fn run_client_loop(
                             &mut write_stream,
                             &mut pending_activation,
                             error,
-                            false,
                         );
                     }
                 } else if let Err(e) = write_to_server(&mut write_stream, &msg) {
@@ -1656,7 +1655,6 @@ async fn run_client_loop(
                                     &mut write_stream,
                                     &mut pending_activation,
                                     "endpoint returned a chunked activation acknowledgement".into(),
-                                    false,
                                 );
                                 continue;
                             }
@@ -1681,16 +1679,12 @@ async fn run_client_loop(
                                         scheduled_activation = Some(event);
                                     }
                                 }
-                                Some(endpoint::SurfaceActivationProgress::Rejected {
-                                    message,
-                                    source_release_rejected,
-                                }) => {
+                                Some(endpoint::SurfaceActivationProgress::Rejected { message }) => {
                                     rollback_endpoint_activation(
                                         &mut state,
                                         &mut write_stream,
                                         &mut pending_activation,
                                         message,
-                                        source_release_rejected,
                                     );
                                 }
                                 _ => {}
@@ -2085,7 +2079,6 @@ async fn run_client_loop(
                         &mut write_stream,
                         &mut pending_activation,
                         format!("{label} did not produce a coherent surface in time"),
-                        false,
                     );
                 }
                 if state.shell.is_some() {
