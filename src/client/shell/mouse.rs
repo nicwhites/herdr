@@ -2092,6 +2092,19 @@ impl ClientShellState {
                     self.tab_press = Some(tab_press);
                     return;
                 }
+                let agent_group_toggle = self
+                    .hits
+                    .agent_group_toggles
+                    .iter()
+                    .find(|(rect, _)| super::contains(*rect, point))
+                    .map(|(_, pane_id)| pane_id.clone());
+                if let Some(pane_id) = agent_group_toggle {
+                    self.toggle_collapsed_agent_group(pane_id);
+                    self.agent_scroll = 0;
+                    self.persist_chrome_preferences(outcome);
+                    outcome.repaint = true;
+                    return;
+                }
                 if self.handle_endpoint_agent_click(point, outcome) {
                     return;
                 }
