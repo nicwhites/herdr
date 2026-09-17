@@ -84,6 +84,17 @@ pub(crate) struct TerminalSearchWindow {
     pub total: usize,
 }
 
+impl TerminalSearchWindow {
+    fn empty() -> Self {
+        Self {
+            matches: Vec::new(),
+            current: None,
+            current_global: None,
+            total: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TerminalWordMotion {
     NextStart,
@@ -217,11 +228,34 @@ pub(crate) struct GhosttyPaneCore {
 
 pub(crate) struct PaneTerminal {
     pub(crate) ghostty: GhosttyPaneTerminal,
+    /// Single-entry cache for the search text buffer. Search and word-copy
+    /// requests otherwise re-walk the whole grid on every call.
+    search_buffer_cache: Mutex<Option<CachedSearchBuffer>>,
+    #[cfg(test)]
+    search_buffer_extractions: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CachedSearchBufferKey {
+    content_seq: u64,
+    cols: u16,
+    total_rows: usize,
+    active_screen: crate::ghostty::ActiveScreen,
+}
+
+struct CachedSearchBuffer {
+    key: CachedSearchBufferKey,
+    buffer: RetainedTextBuffer,
 }
 
 impl PaneTerminal {
     pub(crate) fn new(ghostty: GhosttyPaneTerminal) -> Self {
-        Self { ghostty }
+        Self {
+            ghostty,
+            search_buffer_cache: Mutex::new(None),
+            #[cfg(test)]
+            search_buffer_extractions: std::sync::atomic::AtomicU64::new(0),
+        }
     }
 
     pub fn process_pty_bytes(
@@ -274,16 +308,56 @@ impl PaneTerminal {
         cursor: TerminalTextPoint,
         previous: Option<(TerminalTextPoint, TerminalTextPoint)>,
         limit: usize,
+        content_seq: u64,
     ) -> TerminalSearchWindow {
-        let Some((buffer, active_screen)) = self.retained_text_buffer() else {
-            return TerminalSearchWindow {
-                matches: Vec::new(),
-                current: None,
-                current_global: None,
-                total: 0,
-            };
+        let Some((cols, total_rows, active_screen)) = (|| {
+            let core = self.ghostty.core.lock().ok()?;
+            Some((
+                core.terminal.cols().ok()?,
+                core.terminal.total_rows().ok()?,
+                core.terminal.active_screen().ok()?,
+            ))
+        })() else {
+            return TerminalSearchWindow::empty();
         };
-        buffer.search_window(
+        let key = CachedSearchBufferKey {
+            content_seq,
+            cols,
+            total_rows,
+            active_screen,
+        };
+        if let Ok(cache) = self.search_buffer_cache.lock() {
+            if let Some(cached) = cache.as_ref() {
+                if cached.key == key {
+                    return cached.buffer.search_window(
+                        query,
+                        case_sensitive,
+                        active_screen,
+                        direction,
+                        cursor,
+                        previous,
+                        limit,
+                    );
+                }
+            }
+        }
+        let Some((cols, rows, active_screen)) = (|| {
+            let core = self.ghostty.core.lock().ok()?;
+            let cols = core.terminal.cols().ok()?;
+            let rows = core.terminal.screen_text_rows().ok()?;
+            let active_screen = core.terminal.active_screen().ok()?;
+            Some((cols, rows, active_screen))
+        })() else {
+            return TerminalSearchWindow::empty();
+        };
+        let key = CachedSearchBufferKey {
+            content_seq,
+            cols,
+            total_rows,
+            active_screen,
+        };
+        let buffer = RetainedTextBuffer::new_search(cols, rows, 0);
+        let result = buffer.search_window(
             query,
             case_sensitive,
             active_screen,
@@ -291,7 +365,20 @@ impl PaneTerminal {
             cursor,
             previous,
             limit,
-        )
+        );
+        #[cfg(test)]
+        self.search_buffer_extractions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut cache) = self.search_buffer_cache.lock() {
+            *cache = Some(CachedSearchBuffer { key, buffer });
+        }
+        result
+    }
+
+    #[cfg(test)]
+    fn search_buffer_extraction_count(&self) -> u64 {
+        self.search_buffer_extractions
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn word_motion_target(
@@ -628,17 +715,6 @@ impl PaneTerminal {
             }
             window_rows = window_rows.saturating_mul(2).min(COPY_OBJECT_SCAN_ROWS);
         }
-    }
-
-    fn retained_text_buffer(&self) -> Option<(RetainedTextBuffer, crate::ghostty::ActiveScreen)> {
-        let (cols, rows, active_screen) = {
-            let core = self.ghostty.core.lock().ok()?;
-            let cols = core.terminal.cols().ok()?;
-            let rows = core.terminal.screen_text_rows().ok()?;
-            let active_screen = core.terminal.active_screen().ok()?;
-            (cols, rows, active_screen)
-        };
-        Some((RetainedTextBuffer::new_search(cols, rows, 0), active_screen))
     }
 
     #[cfg(any(unix, test))]
@@ -1040,76 +1116,103 @@ impl RetainedTextBuffer {
         limit: usize,
     ) -> TerminalSearchWindow {
         if query.is_empty() || limit == 0 {
-            return TerminalSearchWindow {
-                matches: Vec::new(),
-                current: None,
-                current_global: None,
-                total: 0,
-            };
+            return TerminalSearchWindow::empty();
         }
         let Ok(regex) = regex::RegexBuilder::new(&regex::escape(query))
             .case_insensitive(!case_sensitive)
             .build()
         else {
-            return TerminalSearchWindow {
-                matches: Vec::new(),
-                current: None,
-                current_global: None,
-                total: 0,
-            };
+            return TerminalSearchWindow::empty();
         };
-        let to_match = |line: &LogicalTextLine, found: regex::Match<'_>| {
+        // Maps a byte range in a merged logical line onto terminal cell
+        // points. Returns None when the range does not land exactly on cell
+        // boundaries (for example inside a multi-grapheme cell), which keeps
+        // the match out of the results and the total, as before.
+        let to_points = |line: &LogicalTextLine, start: usize, end: usize| {
             let start_index = line
                 .spans
-                .binary_search_by_key(&found.start(), |span| span.byte_start)
+                .binary_search_by_key(&start, |span| span.byte_start)
                 .ok()?;
             let end_index = line
                 .spans
-                .binary_search_by_key(&found.end(), |span| span.byte_end)
+                .binary_search_by_key(&end, |span| span.byte_end)
                 .ok()?;
             let start_span = &line.spans[start_index];
             let end_span = &line.spans[end_index];
-            Some(TerminalTextMatch {
-                start: start_span.start,
-                end: end_span.end,
-                source_fingerprint: text_fingerprint(found.as_str()),
-                scan_cols: self.cols,
-                scan_screen: active_screen,
-            })
+            Some((start_span.start, end_span.end))
         };
 
         let origin = match direction {
             TerminalSearchDirection::Forward => previous.map_or(cursor, |(_, end)| end),
             TerminalSearchDirection::Backward => previous.map_or(cursor, |(start, _)| start),
         };
+        // Single scan: count every match exactly while keeping only bounded
+        // bookkeeping (O(limit) retained ranges, never one entry per match).
+        // The returned window is target-centered, so the scan retains the
+        // first `limit` matches, the last `limit` matches, and — once the
+        // target match is known — the matches from the target onward. Match
+        // cell points increase monotonically along the scan, so the matches
+        // on each side of the origin form a prefix/suffix and these three
+        // bounded sets always cover the window built below.
         let mut total = 0usize;
         let mut target = None;
-        for line in &self.lines {
+        let mut head: Vec<(usize, usize, usize)> = Vec::new();
+        let mut tail: std::collections::VecDeque<(usize, usize, usize)> =
+            std::collections::VecDeque::new();
+        let mut tail_last = 0usize;
+        let mut around: Vec<(usize, usize, usize)> = Vec::new();
+        let mut around_start: Option<usize> = None;
+        let mut tail_frozen = false;
+        let mut before_origin_seen = false;
+        for (line_index, line) in self.lines.iter().enumerate() {
             for found in regex.find_iter(&line.text) {
-                let Some(text_match) = to_match(line, found) else {
+                let Some((match_start, match_end)) = to_points(line, found.start(), found.end())
+                else {
                     continue;
                 };
                 match direction {
                     TerminalSearchDirection::Forward
-                        if target.is_none() && text_match.start > origin =>
+                        if target.is_none() && match_start > origin =>
                     {
                         target = Some(total);
+                        tail_frozen = true;
+                        around_start = Some(total);
                     }
-                    TerminalSearchDirection::Backward if text_match.end < origin => {
+                    TerminalSearchDirection::Backward if match_end < origin => {
                         target = Some(total);
+                        before_origin_seen = true;
+                    }
+                    TerminalSearchDirection::Backward if before_origin_seen && !tail_frozen => {
+                        // First match at or after the origin: the previous
+                        // match was the last one before the origin, is the
+                        // final backward target, and is still retained at the
+                        // back of the frozen tail where the window begins.
+                        tail_frozen = true;
+                        if let Some(&entry) = tail.back() {
+                            around.push(entry);
+                            around_start = Some(tail_last);
+                        }
                     }
                     _ => {}
+                }
+                if head.len() < limit {
+                    head.push((line_index, found.start(), found.end()));
+                }
+                if !tail_frozen {
+                    if tail.len() == limit {
+                        tail.pop_front();
+                    }
+                    tail.push_back((line_index, found.start(), found.end()));
+                    tail_last = total;
+                }
+                if around_start.is_some() && around.len() < limit {
+                    around.push((line_index, found.start(), found.end()));
                 }
                 total = total.saturating_add(1);
             }
         }
         if total == 0 {
-            return TerminalSearchWindow {
-                matches: Vec::new(),
-                current: None,
-                current_global: None,
-                total: 0,
-            };
+            return TerminalSearchWindow::empty();
         }
         let target = target.unwrap_or(match direction {
             TerminalSearchDirection::Forward => 0,
@@ -1120,24 +1223,45 @@ impl RetainedTextBuffer {
             .saturating_sub(retained / 2)
             .min(total.saturating_sub(retained));
         let end = start.saturating_add(retained);
-        let mut index = 0usize;
-        let mut matches = Vec::with_capacity(retained);
-        for line in &self.lines {
-            for found in regex.find_iter(&line.text) {
-                let Some(text_match) = to_match(line, found) else {
-                    continue;
-                };
-                if index >= start && index < end {
-                    matches.push(text_match);
+        // Reassemble the requested window from the bounded retained ranges.
+        // `head[k]` is match k, `tail` ends at match `tail_last`, and
+        // `around` begins at match `around_start`; overlapping retained sets
+        // agree on the shared matches, so each window index resolves to the
+        // same range the full list would have held.
+        let tail_first = tail_last + 1 - tail.len();
+        let mut matches = Vec::with_capacity(end - start);
+        for index in start..end {
+            let range = if index < head.len() {
+                Some(head[index])
+            } else if let Some(first) = around_start {
+                if index >= first && index < first + around.len() {
+                    Some(around[index - first])
+                } else {
+                    index
+                        .checked_sub(tail_first)
+                        .and_then(|i| tail.get(i))
+                        .copied()
                 }
-                index = index.saturating_add(1);
-                if index >= end {
-                    break;
-                }
-            }
-            if index >= end {
-                break;
-            }
+            } else {
+                index
+                    .checked_sub(tail_first)
+                    .and_then(|i| tail.get(i))
+                    .copied()
+            };
+            let Some((line_index, found_start, found_end)) = range else {
+                continue;
+            };
+            let line = &self.lines[line_index];
+            let Some((match_start, match_end)) = to_points(line, found_start, found_end) else {
+                continue;
+            };
+            matches.push(TerminalTextMatch {
+                start: match_start,
+                end: match_end,
+                source_fingerprint: text_fingerprint(&line.text[found_start..found_end]),
+                scan_cols: self.cols,
+                scan_screen: active_screen,
+            });
         }
         TerminalSearchWindow {
             matches,
@@ -5001,6 +5125,7 @@ mod tests {
                 TerminalTextPoint { row: 0, col: 0 },
                 None,
                 1,
+                0,
             )
             .matches[0];
 
@@ -5029,6 +5154,7 @@ mod tests {
                 TerminalTextPoint { row: 0, col: 0 },
                 None,
                 1,
+                0,
             )
             .matches[0];
 
@@ -5045,6 +5171,240 @@ mod tests {
                 col: 0,
             })
         );
+    }
+
+    #[test]
+    fn live_terminal_search_cache_reuses_buffer_across_calls() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(10, 3, 200).unwrap();
+        terminal.write(b"needle\r\n");
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap());
+
+        assert_eq!(pane.search_buffer_extraction_count(), 0);
+        for _ in 0..2 {
+            let window = pane.search_text_window(
+                "needle",
+                true,
+                TerminalSearchDirection::Forward,
+                TerminalTextPoint { row: 0, col: 0 },
+                None,
+                1,
+                0,
+            );
+            assert_eq!(window.total, 1);
+        }
+        assert_eq!(pane.search_buffer_extraction_count(), 1);
+    }
+
+    #[test]
+    fn live_terminal_search_cache_invalidates_on_content_change() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(10, 3, 200).unwrap();
+        terminal.write(b"needle\r\n");
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap());
+
+        assert_eq!(pane.search_buffer_extraction_count(), 0);
+        let window = pane.search_text_window(
+            "needle",
+            true,
+            TerminalSearchDirection::Forward,
+            TerminalTextPoint { row: 0, col: 0 },
+            None,
+            1,
+            0,
+        );
+        assert_eq!(window.total, 1);
+        assert_eq!(pane.search_buffer_extraction_count(), 1);
+
+        // New PTY content bumps the runtime's content sequence; the cached
+        // buffer must not be reused for the new content.
+        pane.process_pty_bytes(PaneId::from_raw(1), 0, b"needle\r\n", &tx);
+        let window = pane.search_text_window(
+            "needle",
+            true,
+            TerminalSearchDirection::Forward,
+            TerminalTextPoint { row: 0, col: 0 },
+            None,
+            1,
+            1,
+        );
+        assert_eq!(window.total, 2);
+        assert_eq!(pane.search_buffer_extraction_count(), 2);
+    }
+
+    #[test]
+    fn live_terminal_search_cache_invalidates_on_resize() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(10, 3, 200).unwrap();
+        terminal.write(b"needle\r\n");
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap());
+
+        let window = pane.search_text_window(
+            "needle",
+            true,
+            TerminalSearchDirection::Forward,
+            TerminalTextPoint { row: 0, col: 0 },
+            None,
+            1,
+            0,
+        );
+        assert_eq!(window.total, 1);
+        assert_eq!(pane.search_buffer_extraction_count(), 1);
+
+        pane.resize(3, 12, 8, 16);
+        let window = pane.search_text_window(
+            "needle",
+            true,
+            TerminalSearchDirection::Forward,
+            TerminalTextPoint { row: 0, col: 0 },
+            None,
+            1,
+            0,
+        );
+        assert_eq!(window.total, 1);
+        assert_eq!(pane.search_buffer_extraction_count(), 2);
+    }
+
+    #[test]
+    fn live_terminal_search_cache_invalidates_on_alternate_screen_switch() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(10, 3, 200).unwrap();
+        terminal.write(b"needle\r\n");
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap());
+
+        let window = pane.search_text_window(
+            "needle",
+            true,
+            TerminalSearchDirection::Forward,
+            TerminalTextPoint { row: 0, col: 0 },
+            None,
+            1,
+            0,
+        );
+        assert_eq!(window.total, 1);
+        assert_eq!(pane.search_buffer_extraction_count(), 1);
+
+        // Switching to the alternate screen changes the searched surface
+        // without changing cols or total_rows, so the key's active_screen
+        // component must force a re-extraction.
+        pane.process_pty_bytes(PaneId::from_raw(1), 0, b"\x1b[?1049h", &tx);
+        let window = pane.search_text_window(
+            "needle",
+            true,
+            TerminalSearchDirection::Forward,
+            TerminalTextPoint { row: 0, col: 0 },
+            None,
+            1,
+            0,
+        );
+        assert_eq!(window.total, 0);
+        assert_eq!(pane.search_buffer_extraction_count(), 2);
+    }
+
+    #[test]
+    fn live_terminal_search_window_clamps_limit_but_keeps_exact_total() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(10, 3, 200).unwrap();
+        for _ in 0..50 {
+            terminal.write(b"needle\r\n");
+        }
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap());
+
+        let window = pane.search_text_window(
+            "needle",
+            true,
+            TerminalSearchDirection::Forward,
+            TerminalTextPoint { row: 0, col: 0 },
+            None,
+            5,
+            0,
+        );
+        assert_eq!(window.total, 50);
+        assert_eq!(window.matches.len(), 5);
+        // The first match sits at the cursor, so forward targeting selects the
+        // second match.
+        assert_eq!(window.current_global, Some(1));
+        assert_eq!(window.current, Some(1));
+    }
+
+    #[test]
+    fn live_terminal_search_window_keeps_exact_total_with_bounded_bookkeeping() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(10, 3, 1000).unwrap();
+        for _ in 0..500 {
+            terminal.write(b"x\r\n");
+        }
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap());
+
+        // Forward from the top: the first match sits on the cursor, so the
+        // target is the second match and the window comes from the earliest
+        // matches retained by the scan.
+        let window = pane.search_text_window(
+            "x",
+            true,
+            TerminalSearchDirection::Forward,
+            TerminalTextPoint { row: 0, col: 0 },
+            None,
+            5,
+            0,
+        );
+        assert_eq!(window.total, 500);
+        assert_eq!(window.matches.len(), 5);
+        assert_eq!(window.current_global, Some(1));
+        assert_eq!(window.current, Some(1));
+        for (offset, text_match) in window.matches.iter().enumerate() {
+            assert_eq!(
+                text_match.start,
+                TerminalTextPoint {
+                    row: offset as u32,
+                    col: 0
+                }
+            );
+        }
+
+        // Forward resuming from a match in the middle: the window straddles
+        // the target, so it must be reassembled from the retained ranges
+        // around the target rather than only the head or tail of the scan.
+        let window = pane.search_text_window(
+            "x",
+            true,
+            TerminalSearchDirection::Forward,
+            TerminalTextPoint { row: 0, col: 0 },
+            Some((
+                TerminalTextPoint { row: 250, col: 0 },
+                TerminalTextPoint { row: 250, col: 0 },
+            )),
+            5,
+            0,
+        );
+        assert_eq!(window.total, 500);
+        assert_eq!(window.matches.len(), 5);
+        assert_eq!(window.current_global, Some(251));
+        assert_eq!(window.current, Some(2));
+        for (offset, text_match) in window.matches.iter().enumerate() {
+            let row = 249 + offset as u32;
+            assert_eq!(text_match.start, TerminalTextPoint { row, col: 0 });
+        }
+
+        // Backward from beyond the last match: the window comes from the
+        // final matches retained by the scan.
+        let window = pane.search_text_window(
+            "x",
+            true,
+            TerminalSearchDirection::Backward,
+            TerminalTextPoint { row: 600, col: 0 },
+            None,
+            5,
+            0,
+        );
+        assert_eq!(window.total, 500);
+        assert_eq!(window.matches.len(), 5);
+        assert_eq!(window.current_global, Some(499));
+        assert_eq!(window.current, Some(4));
+        for (offset, text_match) in window.matches.iter().enumerate() {
+            let row = 495 + offset as u32;
+            assert_eq!(text_match.start, TerminalTextPoint { row, col: 0 });
+        }
     }
 
     fn current_palette_color(pane: &GhosttyPaneTerminal, index: u8) -> crate::ghostty::RgbColor {
