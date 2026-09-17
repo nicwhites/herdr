@@ -288,6 +288,37 @@ pub struct PaneCopyMotionParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PaneCopyObjectRequest {
+    Find {
+        ch: char,
+        direction: PaneCopySearchDirection,
+        till: bool,
+        count: u32,
+        repeat: bool,
+    },
+    Object {
+        inside: bool,
+        open: char,
+        close: char,
+        count: u32,
+        /// Word text object (viw/vaw/viW/vaW). When `Some`, the bool marks the
+        /// big-word class (W) and `open`/`close` are ignored.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        word: Option<bool>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneCopyObjectParams {
+    pub pane_id: String,
+    pub cursor: PaneTextPoint,
+    pub request: PaneCopyObjectRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PaneCopySearchDirection {
     Forward,

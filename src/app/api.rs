@@ -1107,11 +1107,17 @@ impl App {
             Method::PaneSelectionRead(params) => {
                 return self.handle_pane_selection_read(request.id, params);
             }
+            Method::PaneSelectionReadBlock(params) => {
+                return self.handle_pane_selection_read_block(request.id, params);
+            }
             Method::PaneCopyMotion(params) => {
                 return self.handle_pane_copy_motion(request.id, params);
             }
             Method::PaneCopySearch(params) => {
                 return self.handle_pane_copy_search(request.id, params);
+            }
+            Method::PaneCopyObject(params) => {
+                return self.handle_pane_copy_object(request.id, params);
             }
             Method::PaneList(params) => return self.handle_pane_list(request.id, params),
             Method::PaneCurrent(params) => return self.handle_pane_current(request.id, params),

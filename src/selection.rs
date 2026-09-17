@@ -41,6 +41,8 @@ pub struct Selection<P = PaneId> {
     cursor: (u32, u16),
     /// Selection phase.
     phase: Phase,
+    /// Rectangular blockwise selection; rows and columns are bounded independently.
+    block: bool,
 }
 
 impl<P> Selection<P> {
@@ -53,6 +55,7 @@ impl<P> Selection<P> {
             anchor,
             cursor: anchor,
             phase: Phase::Anchored,
+            block: false,
         }
     }
 
@@ -62,6 +65,7 @@ impl<P> Selection<P> {
             anchor,
             cursor: anchor,
             phase: Phase::Anchored,
+            block: false,
         }
     }
 
@@ -71,7 +75,37 @@ impl<P> Selection<P> {
             anchor,
             cursor,
             phase: Phase::Dragging,
+            block: false,
         }
+    }
+
+    /// Rectangular blockwise selection; `anchor` and `cursor` may be reversed in either axis.
+    pub(crate) fn block_range(pane_id: P, anchor: (u32, u16), cursor: (u32, u16)) -> Self {
+        Self {
+            pane_id,
+            anchor,
+            cursor,
+            phase: Phase::Dragging,
+            block: true,
+        }
+    }
+
+    /// Whether this is a blockwise (rectangular) selection.
+    pub(crate) fn is_block(&self) -> bool {
+        self.block
+    }
+
+    /// Row and column bounds independently ordered for blockwise use.
+    fn block_bounds(&self) -> ((u32, u32), (u16, u16)) {
+        let rows = (
+            self.anchor.0.min(self.cursor.0),
+            self.anchor.0.max(self.cursor.0),
+        );
+        let cols = (
+            self.anchor.1.min(self.cursor.1),
+            self.anchor.1.max(self.cursor.1),
+        );
+        (rows, cols)
     }
 
     pub(crate) fn line_range(pane_id: P, anchor_row: u32, cursor_row: u32, end_col: u16) -> Self {
@@ -85,6 +119,7 @@ impl<P> Selection<P> {
             anchor: (anchor_row, anchor_col),
             cursor: (cursor_row, cursor_col),
             phase: Phase::Dragging,
+            block: false,
         }
     }
 
@@ -175,6 +210,10 @@ impl<P> Selection<P> {
 
     /// Returns (start, end) in reading order (top-left to bottom-right).
     fn ordered(&self) -> ((u32, u16), (u32, u16)) {
+        if self.block {
+            let (rows, cols) = self.block_bounds();
+            return ((rows.0, cols.0), (rows.1, cols.1));
+        }
         let (ar, ac) = self.anchor;
         let (cr, cc) = self.cursor;
         if ar < cr || (ar == cr && ac <= cc) {
@@ -188,11 +227,14 @@ impl<P> Selection<P> {
         self.ordered()
     }
 
-    pub(crate) fn visible_rects(&self, inner: Rect, metrics: Option<ScrollMetrics>) -> [Rect; 3] {
-        let mut rects = [Rect::default(); 3];
+    pub(crate) fn visible_rects(&self, inner: Rect, metrics: Option<ScrollMetrics>) -> Vec<Rect> {
         if !self.is_visible() || inner.is_empty() {
-            return rects;
+            return Vec::new();
         }
+        if self.block {
+            return self.visible_block_rects(inner, metrics);
+        }
+        let mut rects = Vec::with_capacity(3);
         let ((start_row, start_col), (end_row, end_col)) = self.ordered();
         let top = viewport_top_row(metrics);
         let bottom = top.saturating_add(u32::from(inner.height));
@@ -213,28 +255,60 @@ impl<P> Selection<P> {
             }
         };
         if start_row == end_row {
-            rects[0] = rect(
+            let band = rect(
                 start_row,
                 start_row.saturating_add(1),
                 start_col,
                 end_col.saturating_add(1),
             );
+            if !band.is_empty() {
+                rects.push(band);
+            }
         } else {
-            rects[0] = rect(
+            let band = rect(
                 start_row,
                 start_row.saturating_add(1),
                 start_col,
                 inner.width,
             );
-            rects[1] = rect(start_row.saturating_add(1), end_row, 0, inner.width);
-            rects[2] = rect(
+            if !band.is_empty() {
+                rects.push(band);
+            }
+            let band = rect(start_row.saturating_add(1), end_row, 0, inner.width);
+            if !band.is_empty() {
+                rects.push(band);
+            }
+            let band = rect(
                 end_row,
                 end_row.saturating_add(1),
                 0,
                 end_col.saturating_add(1),
             );
+            if !band.is_empty() {
+                rects.push(band);
+            }
         }
         rects
+    }
+
+    /// One retained rect covering the visible portion of the block's column band.
+    fn visible_block_rects(&self, inner: Rect, metrics: Option<ScrollMetrics>) -> Vec<Rect> {
+        let top = viewport_top_row(metrics);
+        let bottom = top.saturating_add(u32::from(inner.height));
+        let ((first_row, last_row), (first_col, last_col)) = self.block_bounds();
+        let first = first_row.max(top);
+        let end = last_row.saturating_add(1).min(bottom);
+        let left = first_col.min(inner.width);
+        let right = last_col.saturating_add(1).min(inner.width);
+        if first >= end || left >= right {
+            return Vec::new();
+        }
+        vec![Rect::new(
+            inner.x + left,
+            inner.y + (first - top) as u16,
+            right - left,
+            (end - first) as u16,
+        )]
     }
 
     /// Check whether a pane-relative cell (row, col) is inside the selection.
@@ -243,6 +317,10 @@ impl<P> Selection<P> {
             return false;
         }
         let row = absolute_row_for_viewport_row(viewport_row, metrics);
+        if self.block {
+            let ((first_row, last_row), (first_col, last_col)) = self.block_bounds();
+            return (first_row..=last_row).contains(&row) && (first_col..=last_col).contains(&col);
+        }
         let ((sr, sc), (er, ec)) = self.ordered();
         if row < sr || row > er {
             return false;
@@ -403,6 +481,60 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn block_selection_contains_bounded_independently_and_normalizes_corners() {
+        for (start, end) in [
+            ((1, 2), (3, 6)),
+            ((3, 6), (1, 2)),
+            ((3, 2), (1, 6)),
+            ((1, 6), (3, 2)),
+        ] {
+            let sel = Selection::block_range((), start, end);
+            assert_eq!(sel.ordered_cells(), ((1, 2), (3, 6)));
+            assert!(sel.is_block());
+            assert!(sel.contains(1, 2, None));
+            assert!(sel.contains(2, 4, None));
+            assert!(sel.contains(3, 6, None));
+            // Same-row cells outside the column band are excluded.
+            assert!(!sel.contains(2, 1, None));
+            assert!(!sel.contains(2, 7, None));
+            assert!(!sel.contains(0, 4, None));
+            assert!(!sel.contains(4, 4, None));
+        }
+    }
+
+    #[test]
+    fn block_selection_visible_rects_clip_to_viewport_and_column_band() {
+        let inner = Rect::new(0, 0, 10, 4);
+        for top in [0u32, 2] {
+            let metrics = Some(ScrollMetrics {
+                offset_from_bottom: 0,
+                max_offset_from_bottom: top as usize,
+                viewport_rows: 4,
+            });
+            let sel = Selection::block_range((), (1, 2), (8, 5));
+            let rects = sel.visible_rects(inner, metrics);
+            assert!(rects.len() <= usize::from(inner.height));
+            for row in 0..inner.height {
+                for col in 0..inner.width {
+                    assert_eq!(
+                        rects
+                            .iter()
+                            .any(|rect| rect.contains((inner.x + col, inner.y + row).into())),
+                        sel.contains(row, col, metrics),
+                        "top={top} row={row} col={col}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn linear_selections_are_not_block() {
+        assert!(!Selection::absolute_range((), (0, 0), (1, 1)).is_block());
+        assert!(!Selection::line_range((), 0, 1, 10).is_block());
     }
 
     fn make_sel(sr: u32, sc: u16, er: u32, ec: u16) -> Selection {

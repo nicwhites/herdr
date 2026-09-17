@@ -2498,6 +2498,114 @@
           ],
           "type": "object"
         },
+        "PaneCopyObjectParams": {
+          "properties": {
+            "content_revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "cursor": {
+              "$ref": "#/schemas/request/$defs/PaneTextPoint"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "request": {
+              "$ref": "#/schemas/request/$defs/PaneCopyObjectRequest"
+            }
+          },
+          "required": [
+            "pane_id",
+            "cursor",
+            "request"
+          ],
+          "type": "object"
+        },
+        "PaneCopyObjectRequest": {
+          "oneOf": [
+            {
+              "properties": {
+                "ch": {
+                  "maxLength": 1,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "count": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "direction": {
+                  "$ref": "#/schemas/request/$defs/PaneCopySearchDirection"
+                },
+                "kind": {
+                  "const": "find",
+                  "type": "string"
+                },
+                "repeat": {
+                  "type": "boolean"
+                },
+                "till": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "kind",
+                "ch",
+                "direction",
+                "till",
+                "count",
+                "repeat"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "close": {
+                  "maxLength": 1,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "count": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "inside": {
+                  "type": "boolean"
+                },
+                "kind": {
+                  "const": "object",
+                  "type": "string"
+                },
+                "open": {
+                  "maxLength": 1,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "word": {
+                  "description": "Word text object (viw/vaw/viW/vaW). When `Some`, the bool marks the\nbig-word class (W) and `open`/`close` are ignored.",
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "kind",
+                "inside",
+                "open",
+                "close",
+                "count"
+              ],
+              "type": "object"
+            }
+          ]
+        },
         "PaneCopySearchDirection": {
           "enum": [
             "forward",
@@ -5742,6 +5850,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.selection.read_block",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSelectionReadParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.copy_motion",
               "type": "string"
             },
@@ -5763,6 +5887,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneCopySearchParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.copy_object",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneCopyObjectParams"
             }
           },
           "required": [
@@ -9907,6 +10047,32 @@
                 "type",
                 "pane_id",
                 "cursor",
+                "content_revision"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "content_revision": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "range": {
+                  "$ref": "#/schemas/success_response/$defs/PaneTextRange"
+                },
+                "type": {
+                  "const": "pane_copy_object",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "range",
                 "content_revision"
               ],
               "type": "object"

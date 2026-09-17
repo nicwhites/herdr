@@ -20,6 +20,7 @@ const CLIENT_SHELL_METHODS: &[&str] = &[
     "layout.set_split_ratio",
     "pane.close",
     "pane.copy_motion",
+    "pane.copy_object",
     "pane.copy_search",
     "pane.edit_scrollback",
     "pane.focus",
@@ -31,6 +32,7 @@ const CLIENT_SHELL_METHODS: &[&str] = &[
     "pane.resize",
     "pane.scroll",
     "pane.selection.read",
+    "pane.selection.read_block",
     "pane.split",
     "pane.swap",
     "pane.zoom",
@@ -291,6 +293,14 @@ mod tests {
         assert_eq!(
             actual.remove("pane.link.resolve").as_deref(),
             Some("f5e4a3e01453ae7b188f127ce951c12c20e0bebcc17cc364eeb6d1a01fd5bf81")
+        );
+        assert_eq!(
+            actual.remove("pane.copy_object").as_deref(),
+            Some("cabb8a09de5303984f304af8b5498c78a44ffb9c98e0ac092b8cbcfadfec15ab")
+        );
+        assert_eq!(
+            actual.remove("pane.selection.read_block").as_deref(),
+            Some("19ac64da43fb2a74ca420d37be0017fd4286da2066184fab934b2729dab51cd1")
         );
 
         assert_eq!(
