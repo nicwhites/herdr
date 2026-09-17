@@ -64,9 +64,10 @@ impl ActivationEvidence {
 
 #[derive(Clone, Debug)]
 pub(super) enum ActivationPhase {
-    ReleasingSource {
-        request_id: String,
-    },
+    /// The source release write window before the pipelined target activation begins. This
+    /// phase is only observable when a lifecycle write fails before the target was touched;
+    /// responses are not consumed here because the release result is fire-and-forget.
+    ReleasingSource,
     ActivatingTarget {
         request_id: String,
         acknowledged_revision: Option<u64>,
@@ -104,10 +105,7 @@ pub(super) enum ActivationPhase {
 pub(crate) enum SurfaceActivationProgress {
     Pending,
     Ready,
-    Rejected {
-        message: String,
-        source_release_rejected: bool,
-    },
+    Rejected { message: String },
     Stale,
 }
 

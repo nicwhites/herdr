@@ -238,7 +238,7 @@ pub(super) fn begin_endpoint_activation(
             if activation.can_retarget(&endpoint_id) {
                 let retarget_error = activation.retarget(target, endpoints).err();
                 if let Some(error) = retarget_error {
-                    rollback_endpoint_activation(state, endpoints, pending, error, false);
+                    rollback_endpoint_activation(state, endpoints, pending, error);
                 }
             } else {
                 // Once rollback starts, even a request for the original target is a new intent.
@@ -345,7 +345,6 @@ pub(super) fn begin_endpoint_activation(
                         .map(|shell| shell.endpoint_label(&endpoint_id).to_owned())
                         .unwrap_or_else(|| format!("{endpoint_id:?}"))
                 ),
-                false,
             );
         }
     }
@@ -492,12 +491,11 @@ pub(super) fn rollback_endpoint_activation(
     endpoints: &mut endpoint::EndpointRegistry,
     pending: &mut Option<endpoint::PendingEndpointActivation>,
     error: String,
-    source_release_rejected: bool,
 ) {
     let Some(activation) = pending.as_mut() else {
         return;
     };
-    match activation.rollback(endpoints, error.clone(), source_release_rejected) {
+    match activation.rollback(endpoints, error.clone()) {
         endpoint::ActivationRollback::Pending => state.freeze_presentation(),
         endpoint::ActivationRollback::Unavailable(message) => {
             *pending = None;
@@ -714,7 +712,7 @@ pub(super) fn finish_client_shell_input(
         );
         if let Some(activation) = pending_activation.as_mut() {
             if let Err(error) = activation.update_resize(resize, endpoints) {
-                rollback_endpoint_activation(state, endpoints, pending_activation, error, false);
+                rollback_endpoint_activation(state, endpoints, pending_activation, error);
             }
         } else {
             let _ = write_to_server(endpoints, &resize);
@@ -758,13 +756,7 @@ pub(super) fn finish_client_shell_input(
             state.record_host_theme_update(update);
             if let Some(activation) = pending_activation.as_mut() {
                 if let Err(error) = activation.update_host_theme(update.clone(), endpoints) {
-                    rollback_endpoint_activation(
-                        state,
-                        endpoints,
-                        pending_activation,
-                        error,
-                        false,
-                    );
+                    rollback_endpoint_activation(state, endpoints, pending_activation, error);
                 }
                 continue;
             }
@@ -774,13 +766,7 @@ pub(super) fn finish_client_shell_input(
         if let ClientMessage::ClientShellFocus { focused } = request {
             if let Some(activation) = pending_activation.as_mut() {
                 if let Err(error) = activation.update_host_focus(focused, endpoints) {
-                    rollback_endpoint_activation(
-                        state,
-                        endpoints,
-                        pending_activation,
-                        error,
-                        false,
-                    );
+                    rollback_endpoint_activation(state, endpoints, pending_activation, error);
                 }
                 continue;
             }
