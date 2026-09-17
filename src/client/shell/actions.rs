@@ -273,24 +273,27 @@ impl ClientShellState {
             // between the displayed frame and this request must not reject the copy.
             .filter(|_| !live);
         let (anchor, cursor) = selection.ordered_cells();
-        self.push_endpoint_method_with_kind(
-            crate::api::schema::Method::PaneSelectionRead(
-                crate::api::schema::PaneSelectionReadParams {
-                    pane_id,
-                    anchor: crate::api::schema::PaneTextPoint {
-                        row: anchor.0,
-                        col: anchor.1,
-                    },
-                    cursor: crate::api::schema::PaneTextPoint {
-                        row: cursor.0,
-                        col: cursor.1,
-                    },
-                    content_revision,
-                },
-            ),
-            PendingEndpointKind::SelectionCopy,
-            outcome,
-        );
+        let params = crate::api::schema::PaneSelectionReadParams {
+            pane_id,
+            anchor: crate::api::schema::PaneTextPoint {
+                row: anchor.0,
+                col: anchor.1,
+            },
+            cursor: crate::api::schema::PaneTextPoint {
+                row: cursor.0,
+                col: cursor.1,
+            },
+            content_revision,
+        };
+        // Blockwise selections read the rectangular band through the additive read_block
+        // method; a server without it reports the action as unavailable instead of
+        // silently returning linear text.
+        let method = if selection.is_block() {
+            crate::api::schema::Method::PaneSelectionReadBlock(params)
+        } else {
+            crate::api::schema::Method::PaneSelectionRead(params)
+        };
+        self.push_endpoint_method_with_kind(method, PendingEndpointKind::SelectionCopy, outcome);
     }
 
     pub(super) fn push_endpoint_method(
@@ -496,10 +499,28 @@ impl ClientShellState {
         }
         if let Err(error) = &result {
             let code = error.code.as_deref().unwrap_or("invalid_response");
-            if !matches!(
-                code,
-                "confirmation_required" | "stale_content" | "stale_target"
-            ) {
+            // A find boundary that matches nothing is a benign no-op, not a user-facing rejection.
+            let benign_copy_find_no_match = code == "copy_object_unavailable"
+                && matches!(
+                    &pending.kind,
+                    PendingEndpointKind::CopyObject {
+                        request: crate::api::schema::PaneCopyObjectRequest::Find { .. },
+                        ..
+                    }
+                );
+            // A cancelled or superseded copy pipeline must not surface late errors or
+            // timeouts as user-facing notices.
+            let retired_copy_pipeline = pending
+                .kind
+                .copy_session_generation()
+                .is_some_and(|generation| generation != self.copy_session_generation);
+            if !retired_copy_pipeline
+                && !matches!(
+                    code,
+                    "confirmation_required" | "stale_content" | "stale_target"
+                )
+                && !benign_copy_find_no_match
+            {
                 let (kind, notice_code, title, body) = match code {
                     "endpoint_timeout" => (
                         ClientEndpointNoticeKind::Timeout,
@@ -531,6 +552,17 @@ impl ClientShellState {
         }
         match pending.kind {
             PendingEndpointKind::Generic => {}
+            // A retired copy pipeline's late responses must neither mutate state nor drain
+            // or cancel a newer pipeline.
+            kind @ (PendingEndpointKind::CopyMotion { .. }
+            | PendingEndpointKind::CopySearch { .. }
+            | PendingEndpointKind::CopyObject { .. })
+                if kind
+                    .copy_session_generation()
+                    .is_some_and(|generation| generation != self.copy_session_generation) =>
+            {
+                return (false, Vec::new());
+            }
             PendingEndpointKind::PaneLinkResolve { .. } => unreachable!("handled above"),
             PendingEndpointKind::ProductAnnouncementDismiss { version, id } => {
                 return match result {
@@ -687,6 +719,8 @@ impl ClientShellState {
             PendingEndpointKind::CopyMotion {
                 pane_id,
                 origin,
+                motion,
+                remaining,
                 session_generation,
             } => {
                 let mut outcome = ClientShellInput::default();
@@ -695,16 +729,25 @@ impl ClientShellState {
                         pane_id: returned_pane_id,
                         cursor,
                         content_revision,
-                    }) if returned_pane_id == pane_id => (
-                        self.apply_copy_motion_target(
+                    }) if returned_pane_id == pane_id => {
+                        // A repeat chain advances only after a response that moved the cursor.
+                        let progressed = cursor != origin;
+                        let applied = self.apply_copy_motion_target(
                             &pane_id,
                             origin,
                             cursor,
                             content_revision,
                             &mut outcome,
-                        ),
-                        true,
-                    ),
+                        );
+                        if applied && progressed && remaining > 1 {
+                            self.copy_operation_queue
+                                .push_front(ClientCopyOperation::Motion {
+                                    motion,
+                                    remaining: remaining - 1,
+                                });
+                        }
+                        (applied, applied)
+                    }
                     Ok(crate::api::schema::ResponseResult::PaneCopyMotion { .. }) => (false, false),
                     Ok(_) => {
                         self.set_endpoint_error(
@@ -723,6 +766,7 @@ impl ClientShellState {
                 query,
                 direction,
                 repeat,
+                remaining,
                 generation,
                 session_generation,
             } => {
@@ -736,12 +780,13 @@ impl ClientShellState {
                         current,
                         current_global,
                     }) if returned_pane_id == pane_id => {
-                        let repaint = self.apply_copy_search_result(
+                        let applied = self.apply_copy_search_result(
                             &pane_id,
                             origin,
                             query,
                             direction,
                             repeat,
+                            remaining,
                             generation,
                             ClientCopySearchResult {
                                 content_revision,
@@ -752,10 +797,12 @@ impl ClientShellState {
                             },
                             &mut outcome,
                         );
-                        if !repaint {
+                        let repaint = applied == super::copy_mode::CopySearchApply::Applied;
+                        let continue_queue = applied != super::copy_mode::CopySearchApply::Stale;
+                        if !continue_queue {
                             self.cancel_deferred_copy_after_search(generation);
                         }
-                        (repaint, repaint)
+                        (repaint, continue_queue)
                     }
                     Ok(crate::api::schema::ResponseResult::PaneCopySearch { .. }) => {
                         self.cancel_deferred_copy_after_search(generation);
@@ -772,6 +819,61 @@ impl ClientShellState {
                         self.cancel_deferred_copy_after_search(generation);
                         (true, false)
                     }
+                };
+                self.complete_copy_operation(session_generation, continue_queue, &mut outcome);
+                return (repaint || outcome.repaint, outcome.actions);
+            }
+            PendingEndpointKind::CopyObject {
+                pane_id,
+                origin,
+                request,
+                session_generation,
+            } => {
+                let mut outcome = ClientShellInput::default();
+                let (repaint, continue_queue) = match result {
+                    Ok(crate::api::schema::ResponseResult::PaneCopyObject {
+                        pane_id: returned_pane_id,
+                        range,
+                        content_revision,
+                    }) if returned_pane_id == pane_id => match request {
+                        crate::api::schema::PaneCopyObjectRequest::Find { .. } => {
+                            let applied = self.apply_copy_motion_target(
+                                &pane_id,
+                                origin,
+                                range.start,
+                                content_revision,
+                                &mut outcome,
+                            );
+                            (applied, applied)
+                        }
+                        crate::api::schema::PaneCopyObjectRequest::Object { .. } => {
+                            let applied = self.apply_copy_object_range(
+                                &pane_id,
+                                origin,
+                                range,
+                                content_revision,
+                                &mut outcome,
+                            );
+                            (applied, applied)
+                        }
+                    },
+                    Ok(_) => {
+                        self.set_endpoint_error(
+                            "endpoint returned an unexpected copy-object result",
+                        );
+                        (true, false)
+                    }
+                    Err(error)
+                        if matches!(
+                            request,
+                            crate::api::schema::PaneCopyObjectRequest::Find { .. }
+                        ) && error.code.as_deref() == Some("copy_object_unavailable") =>
+                    {
+                        // A no-match find boundary is a benign no-op that keeps queued copy
+                        // operations and input moving.
+                        (false, true)
+                    }
+                    Err(_) => (true, false),
                 };
                 self.complete_copy_operation(session_generation, continue_queue, &mut outcome);
                 return (repaint || outcome.repaint, outcome.actions);

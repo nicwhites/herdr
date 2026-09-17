@@ -651,6 +651,8 @@ pub(super) enum PendingEndpointKind {
     CopyMotion {
         pane_id: String,
         origin: crate::api::schema::PaneTextPoint,
+        motion: crate::api::schema::PaneCopyMotion,
+        remaining: u32,
         session_generation: u64,
     },
     CopySearch {
@@ -659,9 +661,34 @@ pub(super) enum PendingEndpointKind {
         query: String,
         direction: crate::api::schema::PaneCopySearchDirection,
         repeat: bool,
+        remaining: u32,
         generation: u64,
         session_generation: u64,
     },
+    CopyObject {
+        pane_id: String,
+        origin: crate::api::schema::PaneTextPoint,
+        request: crate::api::schema::PaneCopyObjectRequest,
+        session_generation: u64,
+    },
+}
+
+impl PendingEndpointKind {
+    /// Session generation carried by copy-pipeline kinds; `None` otherwise.
+    pub(super) fn copy_session_generation(&self) -> Option<u64> {
+        match self {
+            Self::CopyMotion {
+                session_generation, ..
+            }
+            | Self::CopySearch {
+                session_generation, ..
+            }
+            | Self::CopyObject {
+                session_generation, ..
+            } => Some(*session_generation),
+            _ => None,
+        }
+    }
 }
 
 pub(super) struct PendingEndpointRequest {
@@ -786,21 +813,38 @@ pub(super) enum ClientCopySelection {
     Linewise {
         anchor_row: u32,
     },
+    Block {
+        anchor: crate::api::schema::PaneTextPoint,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ClientCopyLastFind {
+    pub(super) ch: char,
+    pub(super) forward: bool,
+    pub(super) till: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ClientCopySearchPrompt {
     pub(super) direction: crate::api::schema::PaneCopySearchDirection,
     pub(super) query: TextEditor,
+    pub(super) count: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ClientCopyOperation {
-    Motion(crate::api::schema::PaneCopyMotion),
+    /// A motion repeat chain: one queue entry applies up to `remaining` times.
+    Motion {
+        motion: crate::api::schema::PaneCopyMotion,
+        remaining: u32,
+    },
+    CopyObject(crate::api::schema::PaneCopyObjectRequest),
     Search {
         query: String,
         direction: crate::api::schema::PaneCopySearchDirection,
         repeat: bool,
+        remaining: u32,
     },
 }
 
@@ -831,7 +875,16 @@ pub(super) struct ClientCopyModeState {
     pub(super) search_current: Option<usize>,
     pub(super) search_current_global: Option<u64>,
     pub(super) search_generation: u64,
+    /// Generation at which an accepted search result cache was stored; a stale
+    /// generation means Enter must issue a fresh query.
+    pub(super) search_cache_generation: Option<u64>,
     pub(super) copy_after_search: bool,
+    pub(super) pending_count: Option<u32>,
+    /// Awaiting the char target of f/F/t/T: (forward, till).
+    pub(super) pending_find: Option<(bool, bool)>,
+    /// Awaiting the bracket char of vi{/va(: Some(around).
+    pub(super) pending_text_object: Option<bool>,
+    pub(super) last_find: Option<ClientCopyLastFind>,
 }
 
 pub(crate) struct ClientShellState {
@@ -1715,6 +1768,7 @@ impl ClientShellState {
             }
         }
         let mut invalidated_copy_pane = None;
+        let mut copy_geometry_change = None;
         if let Some(copy_mode) = self.copy_mode.as_mut() {
             if let Some(pane) = surface
                 .panes
@@ -1722,8 +1776,9 @@ impl ClientShellState {
                 .find(|pane| pane.pane_id == copy_mode.pane_id)
             {
                 let geometry = (pane.inner_rect.width, pane.inner_rect.height);
-                let coordinates_changed = copy_mode.geometry != geometry
-                    || copy_mode.alternate_screen_active != pane.alternate_screen_active;
+                let screen_switched =
+                    copy_mode.alternate_screen_active != pane.alternate_screen_active;
+                let coordinates_changed = copy_mode.geometry != geometry || screen_switched;
                 if copy_mode.content_revision != pane.content_revision || coordinates_changed {
                     copy_mode.content_revision = pane.content_revision;
                     copy_mode.geometry = geometry;
@@ -1731,6 +1786,8 @@ impl ClientShellState {
                     if coordinates_changed {
                         copy_mode.selection = None;
                         invalidated_copy_pane = Some(copy_mode.pane_id.clone());
+                        copy_geometry_change =
+                            Some((copy_mode.pane_id.clone(), pane.inner_rect, screen_switched));
                     }
                     copy_mode.search_matches.clear();
                     copy_mode.search_total = 0;
@@ -1758,6 +1815,17 @@ impl ClientShellState {
             self.selection = None;
             self.stop_selection_autoscroll();
             self.selection_highlight_clear_deadline = None;
+        }
+        if let Some((pane_id, inner_rect, screen_switched)) = copy_geometry_change {
+            // A coordinate change re-anchors the cursor to the new geometry; ordinary output
+            // never reaches this path and must not reset the live user cursor.
+            self.reset_copy_pipeline();
+            self.reclamp_copy_cursor_after_surface_change(
+                &pane_id,
+                inner_rect,
+                screen_switched,
+                surface.frame.cursor.clone(),
+            );
         }
         self.popup_terminal_id = next_popup;
         self.graphics

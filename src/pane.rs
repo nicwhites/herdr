@@ -67,6 +67,10 @@ const TERMINAL_COMPRESSION_IDLE: std::time::Duration = std::time::Duration::from
 const TERMINAL_COMPRESSION_STEP: std::time::Duration = std::time::Duration::from_millis(1);
 pub(crate) const PANE_TERM: &str = "xterm-256color";
 const PANE_COLORTERM: &str = "truecolor";
+/// Maximum bytes of paste text per bracketed-paste frame. A consumer buffers a whole
+/// frame before processing it, so one giant frame looks frozen; independent frames let
+/// the shell process and echo each one as it arrives.
+const PASTE_FRAME_BYTES: usize = 64 * 1024;
 
 fn terminal_compression_permits() -> Arc<tokio::sync::Semaphore> {
     static PERMITS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
@@ -3146,6 +3150,57 @@ impl PaneRuntime {
         result
     }
 
+    pub(crate) fn find_char_target(
+        &self,
+        row: u32,
+        col: u16,
+        ch: char,
+        forward: bool,
+        till: bool,
+        count: u32,
+        repeat: bool,
+    ) -> Option<crate::pane::TerminalTextPoint> {
+        let result = self
+            .terminal
+            .find_char_target(row, col, ch, forward, till, count, repeat);
+        self.compression.wake();
+        result
+    }
+
+    pub(crate) fn enclosing_object_range(
+        &self,
+        row: u32,
+        col: u16,
+        open: char,
+        close: char,
+        inside: bool,
+        count: u32,
+    ) -> Option<(
+        crate::pane::TerminalTextPoint,
+        crate::pane::TerminalTextPoint,
+    )> {
+        let result = self
+            .terminal
+            .enclosing_object_range(row, col, open, close, inside, count);
+        self.compression.wake();
+        result
+    }
+
+    pub(crate) fn word_object_range(
+        &self,
+        row: u32,
+        col: u16,
+        big: bool,
+        inside: bool,
+    ) -> Option<(
+        crate::pane::TerminalTextPoint,
+        crate::pane::TerminalTextPoint,
+    )> {
+        let result = self.terminal.word_object_range(row, col, big, inside);
+        self.compression.wake();
+        result
+    }
+
     #[cfg(unix)]
     pub fn input_state(&self) -> Option<InputState> {
         self.terminal.input_state()
@@ -3260,6 +3315,15 @@ impl PaneRuntime {
         result
     }
 
+    pub fn extract_block_selection(
+        &self,
+        selection: &crate::selection::Selection,
+    ) -> Option<String> {
+        let result = self.terminal.extract_block_selection(selection);
+        self.compression.wake();
+        result
+    }
+
     pub fn render(&self, frame: &mut Frame, area: Rect, show_cursor: bool) {
         self.terminal.render(frame, area, show_cursor);
     }
@@ -3360,18 +3424,50 @@ impl PaneRuntime {
     }
 
     pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {
-        self.try_send_bytes(self.paste_payload(text))
+        for frame in self.paste_frames(text) {
+            self.try_send_bytes(frame)?;
+        }
+        Ok(())
     }
 
-    fn paste_payload(&self, text: String) -> Bytes {
+    /// Splits a paste into bounded PTY writes; with bracketed paste each chunk is its own
+    /// complete frame (`\x1b[200~…\x1b[201~`). Chunks split at the last newline before the cap
+    /// so line-oriented shells see whole lines, falling back to a char boundary.
+    fn paste_frames(&self, text: String) -> Vec<Bytes> {
         let text = crate::platform::prepare_paste_text_for_pty(text);
         let bracketed = self.bracketed_paste_enabled();
-        let payload = if bracketed {
-            format!("\x1b[200~{text}\x1b[201~")
-        } else {
-            text
-        };
-        Bytes::from(payload)
+        let mut frames = Vec::new();
+        let mut start = 0;
+        while start < text.len() {
+            let mut end = (start + PASTE_FRAME_BYTES).min(text.len());
+            if end < text.len() {
+                // Any '\n' is itself a char boundary, so clamping to a char
+                // boundary first cannot discard a newline at or before the cap.
+                while end > start && !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                if let Some(newline) = text[start..end].rfind('\n') {
+                    end = start + newline + 1;
+                }
+            }
+            let slice = &text[start..end];
+            let payload = if bracketed {
+                format!("\x1b[200~{slice}\x1b[201~")
+            } else {
+                slice.to_owned()
+            };
+            frames.push(Bytes::from(payload));
+            start = end;
+        }
+        if frames.is_empty() {
+            let payload = if bracketed {
+                "\x1b[200~\x1b[201~".to_owned()
+            } else {
+                String::new()
+            };
+            frames.push(Bytes::from(payload));
+        }
+        frames
     }
 
     pub fn try_send_focus_event(&self, event: crate::ghostty::FocusEvent) -> bool {
@@ -3666,6 +3762,88 @@ impl PaneRuntime {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn paste_single_chunk_is_byte_identical_to_bracketed_frame() {
+        let runtime = PaneRuntime::test_with_screen_bytes(20, 5, b"\x1b[?2004h");
+        let text = "hello 界 world".repeat(1_000);
+        assert!(text.len() > 10 * 1024);
+
+        let frames = runtime.paste_frames(text.clone());
+
+        assert_eq!(
+            frames,
+            vec![Bytes::from(format!("\x1b[200~{text}\x1b[201~"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn paste_without_bracketed_paste_emits_raw_text_frames() {
+        let runtime = PaneRuntime::test_with_screen_bytes(20, 5, b"");
+        let text = "plain".to_owned();
+
+        let frames = runtime.paste_frames(text.clone());
+
+        assert_eq!(frames, vec![Bytes::from(text)]);
+    }
+
+    #[tokio::test]
+    async fn paste_multi_frame_split_lands_after_newlines() {
+        let runtime = PaneRuntime::test_with_screen_bytes(20, 5, b"\x1b[?2004h");
+        let mut text = String::new();
+        while text.len() < 150_000 {
+            text.push_str(&"x".repeat(1_000));
+            text.push('\n');
+        }
+
+        let frames = runtime.paste_frames(text.clone());
+
+        assert_eq!(frames.len(), 3);
+        for frame in &frames {
+            assert!(frame.len() <= PASTE_FRAME_BYTES + 12);
+            assert!(frame.starts_with(b"\x1b[200~"));
+            assert!(frame.ends_with(b"\x1b[201~"));
+        }
+        let mut joined = Vec::new();
+        for frame in &frames {
+            joined.extend_from_slice(&frame[6..frame.len() - 6]);
+        }
+        assert_eq!(joined, text.as_bytes());
+        for pair in frames.windows(2) {
+            let split = pair[0].len() - 12;
+            let previous = joined[split - 1];
+            assert_eq!(previous, b'\n', "split must land right after a newline");
+        }
+    }
+
+    #[tokio::test]
+    async fn paste_without_newlines_splits_on_char_boundaries() {
+        let runtime = PaneRuntime::test_with_screen_bytes(20, 5, b"\x1b[?2004h");
+        // '界' is three bytes and straddles the first 64 KiB cap (65534..65537).
+        let mut text = "a".repeat(65_534);
+        text.push('界');
+        text.push_str(&"b".repeat(150_000 - 65_537));
+
+        let frames = runtime.paste_frames(text.clone());
+
+        assert_eq!(frames.len(), 3);
+        let mut joined = Vec::new();
+        for frame in &frames {
+            assert!(frame.starts_with(b"\x1b[200~"));
+            assert!(frame.ends_with(b"\x1b[201~"));
+            joined.extend_from_slice(&frame[6..frame.len() - 6]);
+        }
+        assert_eq!(joined.len(), text.len());
+        assert_eq!(String::from_utf8(joined).expect("split kept utf-8"), text);
+    }
+
+    #[tokio::test]
+    async fn paste_empty_text_keeps_bracketed_frame_markers() {
+        let runtime = PaneRuntime::test_with_screen_bytes(20, 5, b"\x1b[?2004h");
+
+        let frames = runtime.paste_frames(String::new());
+
+        assert_eq!(frames, vec![Bytes::from_static(b"\x1b[200~\x1b[201~")]);
+    }
     use super::*;
 
     #[tokio::test]

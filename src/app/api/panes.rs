@@ -2,12 +2,12 @@ use bytes::Bytes;
 
 use crate::api::schema::{
     EventData, EventEnvelope, EventKind, PaneClearAgentAuthorityParams, PaneCopyMotion,
-    PaneCopyMotionParams, PaneCopySearchDirection, PaneCopySearchParams, PaneCurrentParams,
-    PaneDirection, PaneEdgesParams, PaneEdgesResult, PaneFocusDirectionParams,
-    PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo, PaneInputSetParams,
-    PaneLayoutPane, PaneLayoutParams, PaneLayoutRect, PaneLayoutSnapshot, PaneLayoutSplit,
-    PaneListParams, PaneMoveDestination, PaneMoveParams, PaneMoveReason, PaneMoveResult,
-    PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
+    PaneCopyMotionParams, PaneCopyObjectParams, PaneCopyObjectRequest, PaneCopySearchDirection,
+    PaneCopySearchParams, PaneCurrentParams, PaneDirection, PaneEdgesParams, PaneEdgesResult,
+    PaneFocusDirectionParams, PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo,
+    PaneInputSetParams, PaneLayoutPane, PaneLayoutParams, PaneLayoutRect, PaneLayoutSnapshot,
+    PaneLayoutSplit, PaneListParams, PaneMoveDestination, PaneMoveParams, PaneMoveReason,
+    PaneMoveResult, PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
     PaneProcessInfoProcess, PaneReadParams, PaneReadResult, PaneReleaseAgentParams,
     PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
@@ -29,6 +29,18 @@ use super::super::api_helpers::{
 #[cfg(test)]
 use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
 use super::responses::{encode_error, encode_success};
+
+fn validate_copy_object_scan<T>(
+    result: Option<T>,
+    content_revision: Option<u64>,
+    before: u64,
+    after: u64,
+) -> Result<T, &'static str> {
+    if content_revision.is_some() && after != before {
+        return Err("stale_content");
+    }
+    result.ok_or("copy_object_unavailable")
+}
 
 impl App {
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
@@ -210,6 +222,21 @@ impl App {
         &self,
         params: &PaneSelectionReadParams,
     ) -> Result<String, (&'static str, String)> {
+        self.pane_selection_text_kind(params, false)
+    }
+
+    pub(crate) fn pane_selection_block_text(
+        &self,
+        params: &PaneSelectionReadParams,
+    ) -> Result<String, (&'static str, String)> {
+        self.pane_selection_text_kind(params, true)
+    }
+
+    fn pane_selection_text_kind(
+        &self,
+        params: &PaneSelectionReadParams,
+        block: bool,
+    ) -> Result<String, (&'static str, String)> {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return Err((
                 "pane_not_found",
@@ -232,12 +259,25 @@ impl App {
         {
             return Err(("stale_content", "pane content changed".to_owned()));
         }
-        let selection = crate::selection::Selection::absolute_range(
-            pane_id,
-            (params.anchor.row, params.anchor.col),
-            (params.cursor.row, params.cursor.col),
-        );
-        let Some(text) = runtime.extract_selection(&selection) else {
+        let selection = if block {
+            crate::selection::Selection::block_range(
+                pane_id,
+                (params.anchor.row, params.anchor.col),
+                (params.cursor.row, params.cursor.col),
+            )
+        } else {
+            crate::selection::Selection::absolute_range(
+                pane_id,
+                (params.anchor.row, params.anchor.col),
+                (params.cursor.row, params.cursor.col),
+            )
+        };
+        let extract = if block {
+            runtime.extract_block_selection(&selection)
+        } else {
+            runtime.extract_selection(&selection)
+        };
+        let Some(text) = extract else {
             return Err((
                 "selection_unavailable",
                 "selection text is unavailable".to_owned(),
@@ -255,6 +295,23 @@ impl App {
         params: PaneSelectionReadParams,
     ) -> String {
         match self.pane_selection_text(&params) {
+            Ok(text) => encode_success(
+                id,
+                ResponseResult::PaneSelection {
+                    pane_id: params.pane_id,
+                    text,
+                },
+            ),
+            Err((code, message)) => encode_error(id, code, message),
+        }
+    }
+
+    pub(super) fn handle_pane_selection_read_block(
+        &mut self,
+        id: String,
+        params: PaneSelectionReadParams,
+    ) -> String {
+        match self.pane_selection_block_text(&params) {
             Ok(text) => encode_success(
                 id,
                 ResponseResult::PaneSelection {
@@ -375,6 +432,102 @@ impl App {
                 cursor: crate::api::schema::PaneTextPoint {
                     row: target.row,
                     col: target.col,
+                },
+                content_revision: after,
+            },
+        )
+    }
+
+    pub(super) fn handle_pane_copy_object(
+        &mut self,
+        id: String,
+        params: PaneCopyObjectParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(runtime) =
+            self.state
+                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+        else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let before = runtime.content_seq();
+        if params
+            .content_revision
+            .is_some_and(|revision| revision != before || !before.is_multiple_of(2))
+        {
+            return encode_error(id, "stale_content", "pane content changed");
+        }
+        let range = match params.request {
+            PaneCopyObjectRequest::Find {
+                ch,
+                direction,
+                till,
+                count,
+                repeat,
+            } => {
+                let forward = direction == PaneCopySearchDirection::Forward;
+                runtime
+                    .find_char_target(
+                        params.cursor.row,
+                        params.cursor.col,
+                        ch,
+                        forward,
+                        till,
+                        count,
+                        repeat,
+                    )
+                    .map(|target| (target, target))
+            }
+            PaneCopyObjectRequest::Object {
+                inside,
+                open,
+                close,
+                count,
+                word,
+            } => match word {
+                Some(big) => {
+                    runtime.word_object_range(params.cursor.row, params.cursor.col, big, inside)
+                }
+                None => runtime.enclosing_object_range(
+                    params.cursor.row,
+                    params.cursor.col,
+                    open,
+                    close,
+                    inside,
+                    count,
+                ),
+            },
+        };
+        let after = runtime.content_seq();
+        let (start, end) =
+            match validate_copy_object_scan(range, params.content_revision, before, after) {
+                Ok(range) => range,
+                Err("stale_content") => {
+                    return encode_error(id, "stale_content", "pane content changed");
+                }
+                Err(_) => {
+                    return encode_error(
+                        id,
+                        "copy_object_unavailable",
+                        "requested text object or character was not found",
+                    );
+                }
+            };
+        encode_success(
+            id,
+            ResponseResult::PaneCopyObject {
+                pane_id: params.pane_id,
+                range: PaneTextRange {
+                    start: PaneTextPoint {
+                        row: start.row,
+                        col: start.col,
+                    },
+                    end: PaneTextPoint {
+                        row: end.row,
+                        col: end.col,
+                    },
                 },
                 content_revision: after,
             },
@@ -2208,6 +2361,18 @@ mod tests {
         workspace::Workspace,
     };
 
+    #[test]
+    fn copy_object_staleness_wins_over_a_no_match_result() {
+        assert_eq!(
+            validate_copy_object_scan::<()>(None, Some(4), 4, 6),
+            Err("stale_content")
+        );
+        assert_eq!(
+            validate_copy_object_scan::<()>(None, Some(4), 4, 4),
+            Err("copy_object_unavailable")
+        );
+    }
+
     fn app_with_test_workspace() -> (App, String) {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
@@ -2403,6 +2568,57 @@ mod tests {
             pane.scroll.expect("scroll metrics").offset_from_bottom,
             max_offset as u64
         );
+    }
+
+    #[tokio::test]
+    async fn api_pane_selection_read_block_returns_the_rectangular_band() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        app.state.insert_test_runtime(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(20, 5, 1000, b""),
+        );
+        let runtime = app
+            .state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .unwrap();
+        // 3x5 grid plus a row whose wide cells straddle the block edges:
+        // 日 occupies cols 0-1, 本 cols 2-3, 語 cols 4-5.
+        runtime.test_process_pty_bytes("abcde\r\nfghij\r\nklmno\r\n日本語\r\n".as_bytes());
+
+        let params = |anchor: (u32, u16), cursor: (u32, u16)| PaneSelectionReadParams {
+            pane_id: public_pane_id.clone(),
+            anchor: crate::api::schema::PaneTextPoint {
+                row: anchor.0,
+                col: anchor.1,
+            },
+            cursor: crate::api::schema::PaneTextPoint {
+                row: cursor.0,
+                col: cursor.1,
+            },
+            content_revision: None,
+        };
+
+        // Reversed corners normalize to the same band: rows 1-2, cols 1-3.
+        assert_eq!(
+            app.pane_selection_block_text(&params((1, 1), (2, 3)))
+                .unwrap(),
+            "ghi\nlmn"
+        );
+        assert_eq!(
+            app.pane_selection_block_text(&params((2, 3), (1, 1)))
+                .unwrap(),
+            "ghi\nlmn"
+        );
+
+        // Wide-cell semantics: ghostty's rectangle formatter includes a wide cell whole
+        // when any of its columns overlaps the band, emitting the full character without
+        // spacer-tail padding. Band cols 1-3 keeps 日 (cols 0-1) and 本 (cols 2-3) and drops
+        // 語 (cols 4-5), so three band columns yield two wide characters ("日本").
+        let wide = app
+            .pane_selection_block_text(&params((3, 1), (3, 3)))
+            .unwrap();
+        assert_eq!(wide, "日本");
     }
 
     #[tokio::test]

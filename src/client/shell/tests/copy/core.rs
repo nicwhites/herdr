@@ -1,59 +1,6 @@
 use super::*;
 
 #[test]
-fn pasted_help_and_copy_queries_normalize_single_line_text() {
-    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
-    state.overlay = Some(ClientShellOverlay::Help(ClientHelpOverlay {
-        query: TextEditor::default(),
-        search_focused: true,
-        scroll: 0,
-    }));
-
-    assert!(state.insert_overlay_text("work\nspace"));
-    assert!(matches!(
-        state.overlay,
-        Some(ClientShellOverlay::Help(ClientHelpOverlay { ref query, .. }))
-            if query.as_str() == "work space"
-    ));
-
-    state.overlay = None;
-    state.mode = ClientShellMode::Copy;
-    state.copy_mode = Some(ClientCopyModeState {
-        pane_id: "pane_1".into(),
-        content_revision: 0,
-        geometry: (80, 24),
-        alternate_screen_active: false,
-        cursor: crate::api::schema::PaneTextPoint { row: 0, col: 0 },
-        offset_from_bottom: 0,
-        max_offset_from_bottom: 0,
-        entry_offset_from_bottom: 0,
-        selection: None,
-        search_prompt: Some(ClientCopySearchPrompt {
-            direction: crate::api::schema::PaneCopySearchDirection::Forward,
-            query: TextEditor::default(),
-        }),
-        search_query: String::new(),
-        search_direction: None,
-        search_matches: Vec::new(),
-        search_total: 0,
-        search_current: None,
-        search_current_global: None,
-        search_generation: 0,
-        copy_after_search: false,
-    });
-
-    assert!(state.insert_copy_search_text("needle\r\n"));
-    assert_eq!(
-        state
-            .copy_mode
-            .as_ref()
-            .and_then(|copy_mode| copy_mode.search_prompt.as_ref())
-            .map(|prompt| prompt.query.as_str()),
-        Some("needle ")
-    );
-}
-
-#[test]
 fn client_selection_uses_host_background_and_repaints_when_it_changes() {
     use crate::terminal_theme::{DefaultColorKind, HostAppearance, RgbColor};
     use ratatui::style::Color;
@@ -285,7 +232,6 @@ fn retained_mouse_selection_survives_output_and_copies_without_terminal_input() 
         .as_ref()
         .is_some_and(crate::selection::Selection::is_finalized));
 
-    // A patch that redraws selected text must retain the same live terminal range.
     let mut updated = state.pane_surface.clone().expect("pane surface");
     updated.panes[0].content_revision += 1;
     let mut cell = updated.frame.cells[0].clone();
@@ -304,7 +250,7 @@ fn retained_mouse_selection_survives_output_and_copies_without_terminal_input() 
             }],
             cursor: updated.frame.cursor,
         }),
-        super::super::surface_patch::ClientPaneSurfacePatchOutcome::Applied(_)
+        super::super::super::surface_patch::ClientPaneSurfacePatchOutcome::Applied(_)
     ));
     assert!(state
         .selection
@@ -487,10 +433,12 @@ fn keyboard_copy_mode_owns_cursor_selection_copy_and_scroll_restore() {
         KeyCode::Char('v'),
         KeyModifiers::empty(),
     ))]);
-    state.handle_raw_events(vec![RawInputEvent::Key(crate::input::TerminalKey::new(
-        KeyCode::Char('l'),
-        KeyModifiers::empty(),
-    ))]);
+    let origin = state.copy_mode.as_ref().unwrap().cursor;
+    let horizontal = state.handle_raw_events(vec![RawInputEvent::Key(
+        crate::input::TerminalKey::new(KeyCode::Char('l'), KeyModifiers::empty()),
+    )]);
+    assert!(horizontal.actions.is_empty(), "l moves locally");
+    assert_eq!(state.copy_mode.as_ref().unwrap().cursor.col, origin.col + 1);
     assert!(state
         .selection
         .as_ref()
@@ -523,7 +471,6 @@ fn keyboard_copy_mode_owns_cursor_selection_copy_and_scroll_restore() {
 
 #[test]
 fn keyboard_selections_survive_output_and_copy_live_ranges() {
-    // Character and linewise selections have distinct anchor/range projections.
     for selection_key in [b"v", b"V"] {
         let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
         state.set_snapshot(Box::new(snapshot()));
@@ -572,45 +519,6 @@ fn keyboard_selections_survive_output_and_copy_live_ranges() {
         assert!(state.selection.is_none());
         assert!(state.copy_mode.is_none());
     }
-}
-
-#[test]
-fn empty_keyboard_anchor_keeps_search_fallback_revision_guard() {
-    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
-    state.set_snapshot(Box::new(snapshot()));
-    let mut pane_surface = surface();
-    pane_surface.panes[0].scroll = Some(crate::protocol::PaneSurfaceScrollMetrics {
-        offset_from_bottom: 0,
-        max_offset_from_bottom: 0,
-        viewport_rows: 2,
-    });
-    state.set_pane_surface(pane_surface);
-    state.compose(106, 20).expect("composed frame");
-    state.handle_input_bytes(b"\x02[");
-    let search = state.handle_input_bytes(b"/LIVE\r");
-    let [ClientShellAction::Endpoint { request, .. }] = &search.actions[..] else {
-        panic!("search request");
-    };
-    let found = crate::api::schema::PaneTextRange {
-        start: crate::api::schema::PaneTextPoint { row: 0, col: 0 },
-        end: crate::api::schema::PaneTextPoint { row: 0, col: 3 },
-    };
-    state.handle_endpoint_result(
-        "boot-1",
-        &request.id,
-        Ok(copy_search_result(vec![found], Some(0))),
-    );
-    state.handle_input_bytes(b"v");
-    assert!(!state.selection.as_ref().unwrap().is_visible());
-    let copy = state.handle_input_bytes(b"y");
-    assert!(copy.actions.iter().any(|action| matches!(
-        action,
-        ClientShellAction::Endpoint { request, .. }
-            if matches!(&request.method, crate::api::schema::Method::PaneSelectionRead(params)
-                if params.anchor == found.start
-                    && params.cursor == found.end
-                    && params.content_revision == Some(0))
-    )));
 }
 
 #[test]
@@ -702,244 +610,6 @@ fn keyboard_copy_mode_content_motion_is_endpoint_backed_and_stale_safe() {
 }
 
 #[test]
-fn copy_search_owns_prompt_repeat_highlights_selection_and_restore() {
-    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
-    state.set_snapshot(Box::new(snapshot()));
-    let mut pane_surface = surface();
-    pane_surface.panes[0].scroll = Some(crate::protocol::PaneSurfaceScrollMetrics {
-        offset_from_bottom: 0,
-        max_offset_from_bottom: 20,
-        viewport_rows: 2,
-    });
-    state.set_pane_surface(pane_surface);
-    state.compose(106, 20).expect("composed frame");
-    let mut enter = ClientShellInput::default();
-    state.record_binding(
-        crate::input::KeybindMatch::Action(crate::input::KeybindAction::CopyMode),
-        &mut enter,
-    );
-    let origin = state.copy_mode.as_ref().expect("copy mode").cursor;
-
-    state.handle_raw_events(vec![RawInputEvent::Key(crate::input::TerminalKey::new(
-        KeyCode::Char('?'),
-        KeyModifiers::SHIFT,
-    ))]);
-    assert!(state.copy_mode.as_ref().is_some_and(|mode| {
-        mode.search_prompt.as_ref().is_some_and(|prompt| {
-            prompt.direction == crate::api::schema::PaneCopySearchDirection::Backward
-        })
-    }));
-    state.handle_raw_events(vec![RawInputEvent::Key(crate::input::TerminalKey::new(
-        KeyCode::Esc,
-        KeyModifiers::empty(),
-    ))]);
-    assert!(state
-        .copy_mode
-        .as_ref()
-        .is_some_and(|mode| mode.search_prompt.is_none()));
-
-    state.handle_raw_events(vec![RawInputEvent::Key(crate::input::TerminalKey::new(
-        KeyCode::Char('/'),
-        KeyModifiers::empty(),
-    ))]);
-    state.handle_raw_events(vec![RawInputEvent::Text(crate::input::TextCommit::new(
-        "junk",
-    ))]);
-    state.handle_raw_events(vec![RawInputEvent::Key(crate::input::TerminalKey::new(
-        KeyCode::Char('u'),
-        KeyModifiers::CONTROL,
-    ))]);
-    state.handle_raw_events(vec![RawInputEvent::Text(crate::input::TextCommit::new(
-        "nee",
-    ))]);
-    state.handle_raw_events(vec![RawInputEvent::Paste("dleX".into())]);
-    state.handle_raw_events(vec![RawInputEvent::Key(crate::input::TerminalKey::new(
-        KeyCode::Backspace,
-        KeyModifiers::empty(),
-    ))]);
-    assert_eq!(
-        state
-            .copy_mode
-            .as_ref()
-            .and_then(|mode| mode.search_prompt.as_ref())
-            .map(|prompt| prompt.query.as_str()),
-        Some("needle")
-    );
-
-    let search = state.handle_raw_events(vec![RawInputEvent::Key(crate::input::TerminalKey::new(
-        KeyCode::Enter,
-        KeyModifiers::empty(),
-    ))]);
-    let [ClientShellAction::Endpoint { request, .. }] = &search.actions[..] else {
-        panic!("search should use endpoint terminal semantics");
-    };
-    let request_id = request.id.clone();
-    assert!(matches!(
-        &request.method,
-        crate::api::schema::Method::PaneCopySearch(params)
-            if params.pane_id == "pane_1"
-                && params.query == "needle"
-                && params.direction == crate::api::schema::PaneCopySearchDirection::Forward
-                && params.cursor == origin
-                && params.previous.is_none()
-    ));
-    let matches = vec![
-        crate::api::schema::PaneTextRange {
-            start: crate::api::schema::PaneTextPoint { row: 5, col: 2 },
-            end: crate::api::schema::PaneTextPoint { row: 5, col: 7 },
-        },
-        crate::api::schema::PaneTextRange {
-            start: crate::api::schema::PaneTextPoint { row: 15, col: 1 },
-            end: crate::api::schema::PaneTextPoint { row: 15, col: 6 },
-        },
-    ];
-    let (repaint, actions) = state.handle_endpoint_result(
-        "boot-1",
-        &request_id,
-        Ok(copy_search_result(matches.clone(), Some(0))),
-    );
-    assert!(repaint);
-    assert_eq!(
-        state.copy_mode.as_ref().map(|mode| mode.cursor.row),
-        Some(5)
-    );
-    assert!(actions.iter().any(|action| matches!(
-        action,
-        ClientShellAction::Endpoint { request, .. }
-            if matches!(
-                &request.method,
-                crate::api::schema::Method::PaneScroll(params)
-                    if params.offset_from_bottom == 15
-            )
-    )));
-    let initial_scroll_id = actions
-        .iter()
-        .find_map(|action| match action {
-            ClientShellAction::Endpoint { request, .. }
-                if matches!(request.method, crate::api::schema::Method::PaneScroll(_)) =>
-            {
-                Some(request.id.clone())
-            }
-            _ => None,
-        })
-        .expect("initial search scroll");
-    state.handle_endpoint_result(
-        "boot-1",
-        &initial_scroll_id,
-        Ok(pane_scroll_result(15, 20, 2)),
-    );
-    let mut scrolled_surface = state.pane_surface.clone().expect("pane surface");
-    scrolled_surface.panes[0]
-        .scroll
-        .as_mut()
-        .expect("scroll metrics")
-        .offset_from_bottom = 15;
-    state.set_pane_surface(scrolled_surface);
-    let frame = state.compose(106, 20).expect("search frame");
-    let hit = state.hits.panes[0].clone();
-    let viewport_top = 5u16;
-    let restored = frame.to_ratatui_buffer().expect("search frame buffer");
-    let highlighted = restored
-        .cell((hit.inner_rect.x + 2, hit.inner_rect.y + (5 - viewport_top)))
-        .expect("highlighted search cell");
-    assert_eq!(highlighted.bg, state.config.palette.accent);
-
-    state.handle_raw_events(vec![RawInputEvent::Key(crate::input::TerminalKey::new(
-        KeyCode::Char('v'),
-        KeyModifiers::empty(),
-    ))]);
-    let repeat = state.handle_raw_events(vec![RawInputEvent::Key(crate::input::TerminalKey::new(
-        KeyCode::Char('n'),
-        KeyModifiers::empty(),
-    ))]);
-    let [ClientShellAction::Endpoint { request, .. }] = &repeat.actions[..] else {
-        panic!("repeat should use endpoint search");
-    };
-    let repeat_id = request.id.clone();
-    assert!(matches!(
-        &request.method,
-        crate::api::schema::Method::PaneCopySearch(params)
-            if params.direction == crate::api::schema::PaneCopySearchDirection::Forward
-                && params.previous == Some(matches[0])
-    ));
-    let (_, repeat_actions) = state.handle_endpoint_result(
-        "boot-1",
-        &repeat_id,
-        Ok(copy_search_result(matches.clone(), Some(1))),
-    );
-    if let Some(scroll_id) = repeat_actions.iter().find_map(|action| match action {
-        ClientShellAction::Endpoint { request, .. }
-            if matches!(request.method, crate::api::schema::Method::PaneScroll(_)) =>
-        {
-            Some(request.id.clone())
-        }
-        _ => None,
-    }) {
-        state.handle_endpoint_result("boot-1", &scroll_id, Ok(pane_scroll_result(6, 20, 2)));
-    }
-    assert_eq!(
-        state.copy_mode.as_ref().map(|mode| mode.cursor.row),
-        Some(15)
-    );
-    assert!(state
-        .selection
-        .as_ref()
-        .is_some_and(crate::selection::Selection::is_visible));
-
-    let reverse = state.handle_raw_events(vec![RawInputEvent::Key(
-        crate::input::TerminalKey::new(KeyCode::Char('N'), KeyModifiers::SHIFT),
-    )]);
-    let [ClientShellAction::Endpoint { request, .. }] = &reverse.actions[..] else {
-        panic!("reverse search should use endpoint search");
-    };
-    assert!(matches!(
-        &request.method,
-        crate::api::schema::Method::PaneCopySearch(params)
-            if params.direction == crate::api::schema::PaneCopySearchDirection::Backward
-                && params.previous == Some(matches[1])
-    ));
-    let (_, reverse_actions) = state.handle_endpoint_result(
-        "boot-1",
-        &request.id,
-        Ok(copy_search_result(matches.clone(), Some(0))),
-    );
-    if let Some(scroll_id) = reverse_actions.iter().find_map(|action| match action {
-        ClientShellAction::Endpoint { request, .. }
-            if matches!(request.method, crate::api::schema::Method::PaneScroll(_)) =>
-        {
-            Some(request.id.clone())
-        }
-        _ => None,
-    }) {
-        state.handle_endpoint_result("boot-1", &scroll_id, Ok(pane_scroll_result(15, 20, 2)));
-    }
-
-    state.handle_raw_events(vec![RawInputEvent::Key(crate::input::TerminalKey::new(
-        KeyCode::Esc,
-        KeyModifiers::empty(),
-    ))]);
-    assert_eq!(state.mode, ClientShellMode::Copy);
-    assert!(state
-        .copy_mode
-        .as_ref()
-        .is_some_and(|mode| mode.search_query.is_empty() && mode.selection.is_none()));
-    let exit = state.handle_raw_events(vec![RawInputEvent::Key(crate::input::TerminalKey::new(
-        KeyCode::Esc,
-        KeyModifiers::empty(),
-    ))]);
-    assert_eq!(state.mode, ClientShellMode::Terminal);
-    assert!(exit.actions.iter().any(|action| matches!(
-        action,
-        ClientShellAction::Endpoint { request, .. }
-            if matches!(
-                &request.method,
-                crate::api::schema::Method::PaneScroll(params)
-                    if params.offset_from_bottom == 0
-            )
-    )));
-}
-
-#[test]
 fn navigator_renders_connected_siblings_and_ancestor_lines() {
     let mut snapshot = snapshot();
     snapshot.focused_pane_id = None;
@@ -1018,7 +688,6 @@ fn navigator_renders_connected_siblings_and_ancestor_lines() {
         ]
     );
 
-    // The editor ancestor is above this viewport; the logs sibling is below it.
     let Some(ClientShellOverlay::Navigator(navigator)) = state.overlay.as_mut() else {
         panic!("expected navigator");
     };
@@ -1032,7 +701,6 @@ fn navigator_renders_connected_siblings_and_ancestor_lines() {
         ["│  ├──", "│  └──", "├── no", "│  └──"]
     );
 
-    // Excluded siblings must not leave dangling continuation lines.
     let Some(ClientShellOverlay::Navigator(navigator)) = state.overlay.as_mut() else {
         panic!("expected navigator");
     };
@@ -1414,7 +1082,7 @@ fn queued_copy_keys_preserve_prefix_order() {
         ClientShellAction::Endpoint { request, .. } => request.id.clone(),
         _ => unreachable!(),
     };
-    state.handle_endpoint_result(
+    let (_, horizontal) = state.handle_endpoint_result(
         "boot-1",
         &motion_id,
         Ok(crate::api::schema::ResponseResult::PaneCopyMotion {
@@ -1423,6 +1091,14 @@ fn queued_copy_keys_preserve_prefix_order() {
             content_revision: 0,
         }),
     );
+    assert!(horizontal.iter().all(|action| !matches!(
+        action,
+        ClientShellAction::Endpoint { request, .. }
+            if matches!(
+                &request.method,
+                crate::api::schema::Method::PaneCopyObject(_)
+            )
+    )));
     assert_eq!(state.mode, ClientShellMode::Prefix);
     assert_eq!(
         state
@@ -1516,43 +1192,6 @@ fn copy_waits_for_endpoint_motion_before_copying_selection() {
 }
 
 #[test]
-fn new_content_revision_invalidates_copy_search_coordinates() {
-    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
-    state.set_snapshot(Box::new(snapshot()));
-    let mut pane_surface = surface();
-    pane_surface.panes[0].scroll = Some(crate::protocol::PaneSurfaceScrollMetrics {
-        offset_from_bottom: 0,
-        max_offset_from_bottom: 0,
-        viewport_rows: 2,
-    });
-    state.set_pane_surface(pane_surface.clone());
-    state.compose(106, 20).expect("composed frame");
-    let mut enter = ClientShellInput::default();
-    state.record_binding(
-        crate::input::KeybindMatch::Action(crate::input::KeybindAction::CopyMode),
-        &mut enter,
-    );
-    let copy_mode = state.copy_mode.as_mut().expect("copy mode");
-    copy_mode.search_query = "needle".into();
-    copy_mode
-        .search_matches
-        .push(crate::api::schema::PaneTextRange {
-            start: crate::api::schema::PaneTextPoint { row: 0, col: 0 },
-            end: crate::api::schema::PaneTextPoint { row: 0, col: 1 },
-        });
-    copy_mode.search_total = 1;
-    copy_mode.search_current = Some(0);
-    copy_mode.search_current_global = Some(0);
-
-    pane_surface.panes[0].content_revision = 2;
-    state.set_pane_surface(pane_surface);
-    let copy_mode = state.copy_mode.as_ref().expect("copy mode retained");
-    assert!(copy_mode.search_matches.is_empty());
-    assert_eq!(copy_mode.search_total, 0);
-    assert_eq!(copy_mode.search_current, None);
-}
-
-#[test]
 fn word_selection_result_survives_focus_snapshot_lag() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     state.set_snapshot(Box::new(snapshot()));
@@ -1582,4 +1221,121 @@ fn word_selection_result_survives_focus_snapshot_lag() {
         .selection
         .as_ref()
         .is_some_and(crate::selection::Selection::is_visible));
+}
+
+#[test]
+fn stale_copy_motion_result_cancels_queued_operations_and_input() {
+    let mut state = copy_mode_state_with_scroll(0, 0);
+    let origin = state.copy_mode.as_ref().unwrap().cursor;
+    state.handle_raw_events(vec![copy_mode_key('3')]);
+    let motion = state.handle_raw_events(vec![copy_mode_key('w')]);
+    state.handle_raw_events(vec![copy_mode_key('l')]);
+    assert_eq!(state.copy_operation_queue.len(), 0);
+    assert_eq!(state.copy_input_queue.len(), 1);
+
+    let mut changed = state.pane_surface.clone().unwrap();
+    changed.surface_revision += 1;
+    changed.panes[0].content_revision = 2;
+    state.set_pane_surface(changed);
+    let request_id = match &motion.actions[0] {
+        ClientShellAction::Endpoint { request, .. } => request.id.clone(),
+        _ => unreachable!(),
+    };
+    let (_, actions) = state.handle_endpoint_result(
+        "boot-1",
+        &request_id,
+        Ok(crate::api::schema::ResponseResult::PaneCopyMotion {
+            pane_id: "pane_1".into(),
+            cursor: crate::api::schema::PaneTextPoint {
+                row: origin.row,
+                col: origin.col + 1,
+            },
+            content_revision: 0,
+        }),
+    );
+    assert!(actions.is_empty());
+    assert!(!state.copy_operation_in_flight);
+    assert!(state.copy_operation_queue.is_empty());
+    assert!(state.copy_input_queue.is_empty());
+    assert_eq!(state.copy_mode.as_ref().unwrap().cursor, origin);
+}
+
+#[test]
+fn geometry_change_reanchors_copy_cursor_and_invalidates_late_results() {
+    let mut state = copy_mode_state_with_scroll(0, 0);
+    let origin = state.copy_mode.as_ref().expect("copy mode").cursor;
+    let motion = state.handle_raw_events(vec![copy_mode_key('w')]);
+    let request_id = match &motion.actions[..] {
+        [ClientShellAction::Endpoint { request, .. }] => request.id.clone(),
+        _ => panic!("w should dispatch a word motion request"),
+    };
+    let mut narrow = state.pane_surface.clone().unwrap();
+    narrow.surface_revision += 1;
+    narrow.panes[0].inner_rect.width = 1;
+    state.set_pane_surface(narrow);
+    assert_eq!(
+        state.copy_mode.as_ref().unwrap().cursor.col,
+        0,
+        "the cursor column must clamp to the narrowed pane"
+    );
+    let (_, actions) = state.handle_endpoint_result(
+        "boot-1",
+        &request_id,
+        Ok(crate::api::schema::ResponseResult::PaneCopyMotion {
+            pane_id: "pane_1".into(),
+            cursor: origin,
+            content_revision: 0,
+        }),
+    );
+    assert!(actions.is_empty(), "late results must not move the cursor");
+    assert_eq!(state.copy_mode.as_ref().unwrap().cursor.col, 0);
+
+    // A primary-to-alternate switch re-anchors the absolute scrollback row.
+    let mut state = copy_mode_state_with_scroll(0, 20);
+    assert_eq!(state.copy_mode.as_ref().unwrap().cursor.row, 21);
+    let mut alternate = state.pane_surface.clone().unwrap();
+    alternate.surface_revision += 1;
+    alternate.panes[0].alternate_screen_active = true;
+    alternate.panes[0].scroll = Some(crate::protocol::PaneSurfaceScrollMetrics {
+        offset_from_bottom: 0,
+        max_offset_from_bottom: 0,
+        viewport_rows: 2,
+    });
+    state.set_pane_surface(alternate);
+    let copy_mode = state.copy_mode.as_ref().expect("copy mode stays open");
+    assert_eq!(
+        copy_mode.cursor.row, 1,
+        "the cursor re-anchors to the frame cursor row"
+    );
+    assert_eq!(copy_mode.cursor.col, 1);
+
+    // An alternate-to-primary switch must also re-anchor: the absolute row is stranded.
+    let mut primary = state.pane_surface.clone().unwrap();
+    primary.surface_revision += 1;
+    primary.panes[0].alternate_screen_active = false;
+    primary.panes[0].scroll = Some(crate::protocol::PaneSurfaceScrollMetrics {
+        offset_from_bottom: 1000,
+        max_offset_from_bottom: 2000,
+        viewport_rows: 2,
+    });
+    state.set_pane_surface(primary);
+    let copy_mode = state.copy_mode.as_ref().expect("copy mode stays open");
+    assert_eq!(
+        copy_mode.cursor.row, 1001,
+        "the cursor anchors into the visible primary viewport, not the old alt row"
+    );
+    assert_eq!(copy_mode.cursor.col, 1);
+
+    // Ordinary output (content-only change) never resets the live user cursor.
+    let mut state = copy_mode_state_with_scroll(0, 20);
+    state.copy_mode.as_mut().unwrap().cursor = crate::api::schema::PaneTextPoint { row: 5, col: 3 };
+    let mut output = state.pane_surface.clone().unwrap();
+    output.surface_revision += 1;
+    output.panes[0].content_revision = 2;
+    state.set_pane_surface(output);
+    assert_eq!(
+        state.copy_mode.as_ref().unwrap().cursor,
+        crate::api::schema::PaneTextPoint { row: 5, col: 3 },
+        "ordinary output must not reset the live cursor"
+    );
 }

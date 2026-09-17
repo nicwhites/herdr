@@ -412,6 +412,224 @@ impl PaneTerminal {
         None
     }
 
+    pub(crate) fn find_char_target(
+        &self,
+        row: u32,
+        col: u16,
+        ch: char,
+        forward: bool,
+        till: bool,
+        count: u32,
+        repeat: bool,
+    ) -> Option<TerminalTextPoint> {
+        // Snapshot an adaptive window around the cursor's soft-wrapped logical line, releasing
+        // the lock before glyph extraction so scanning never blocks parsing.
+        let (line_start, line_end, line_base_row, rows) = {
+            let core = self.ghostty.core.lock().ok()?;
+            let total_rows = core.terminal.total_rows().ok()?;
+            let current = usize::try_from(row).ok()?;
+            if current >= total_rows {
+                return None;
+            }
+            let mut window_rows = 64usize;
+            loop {
+                let start_row = current.saturating_sub(window_rows.saturating_sub(1));
+                let end_row = current.saturating_add(window_rows).min(total_rows);
+                let rows = core
+                    .terminal
+                    .screen_text_rows_range(start_row, end_row)
+                    .ok()?;
+                let (line_start, line_end, needs_more_history, needs_more_future) =
+                    snapshot_logical_line_extent(&rows, start_row, current, total_rows);
+                if !needs_more_history && !needs_more_future {
+                    break (line_start, line_end, start_row, rows);
+                }
+                window_rows = window_rows.saturating_mul(2);
+            }
+        };
+        let line_base = u32::try_from(line_base_row + line_start).ok()?;
+        let line_rows = &rows[line_start..=line_end];
+        let glyphs = copy_glyphs(line_rows, line_base);
+        let points = copy_logical_line_motion_points(line_rows, line_base);
+        let cursor = TerminalTextPoint { row, col };
+        let mut remaining = count.max(1);
+        if forward {
+            for glyph in glyphs.iter() {
+                if glyph.ch != ch || glyph.start <= cursor {
+                    continue;
+                }
+                let target = if till {
+                    // The till destination is the cell immediately before the glyph, which may
+                    // be an unwritten blank cell; wide cells normalize to their lead cell.
+                    let position = points.partition_point(|point| point.start < glyph.start);
+                    points.get(position.checked_sub(1)?)?.start
+                } else {
+                    glyph.start
+                };
+                if repeat && till && target <= cursor {
+                    continue;
+                }
+                remaining -= 1;
+                if remaining == 0 {
+                    return Some(target);
+                }
+            }
+        } else {
+            for glyph in glyphs.iter().rev() {
+                if glyph.ch != ch || glyph.end >= cursor {
+                    continue;
+                }
+                let target = if till {
+                    // points holds one entry per logical cell (wide spacer tails excluded), so
+                    // the cell after the glyph is always the next entry.
+                    let position = points.partition_point(|point| point.start <= glyph.end);
+                    points.get(position)?.start
+                } else {
+                    glyph.start
+                };
+                if repeat && till && target >= cursor {
+                    continue;
+                }
+                remaining -= 1;
+                if remaining == 0 {
+                    return Some(target);
+                }
+            }
+        }
+        None
+    }
+
+    pub(crate) fn enclosing_object_range(
+        &self,
+        row: u32,
+        col: u16,
+        open: char,
+        close: char,
+        inside: bool,
+        count: u32,
+    ) -> Option<(TerminalTextPoint, TerminalTextPoint)> {
+        let depth = usize::try_from(count.max(1).saturating_sub(1)).ok()?;
+        let cursor = TerminalTextPoint { row, col };
+        let mut window_rows = 64usize;
+        let (pair, cols) = loop {
+            let (cols, start_row, end_row, rows, reached_history_edge, reached_future_edge) = {
+                let core = self.ghostty.core.lock().ok()?;
+                let cols = core.terminal.cols().ok()?;
+                let total_rows = core.terminal.total_rows().ok()?;
+                let current = usize::try_from(row).ok()?;
+                if current >= total_rows {
+                    return None;
+                }
+                let (start_row, end_row) =
+                    copy_object_window_bounds(current, total_rows, window_rows);
+                let rows = core
+                    .terminal
+                    .screen_text_rows_range(start_row, end_row)
+                    .ok()?;
+                (
+                    cols,
+                    start_row,
+                    end_row,
+                    rows,
+                    start_row == 0,
+                    end_row == total_rows,
+                )
+            };
+            let glyphs = copy_glyphs(&rows, u32::try_from(start_row).ok()?);
+            let pair = select_object_pair(&glyphs, open, close, cursor, depth)
+                .map(|(opener, closer)| (glyphs[opener], glyphs[closer]));
+            // A pair strictly inside the window cannot change when the window grows. No pair
+            // at all is not final: the enclosing delimiters may lie outside this window.
+            let stable = pair.is_some_and(|(opener, closer)| {
+                copy_object_pair_is_stable(
+                    usize::try_from(opener.start.row).unwrap_or(usize::MAX),
+                    usize::try_from(closer.end.row).unwrap_or(usize::MAX),
+                    start_row,
+                    end_row,
+                    reached_history_edge,
+                    reached_future_edge,
+                )
+            });
+            if stable || (reached_history_edge && reached_future_edge) {
+                break (pair, cols);
+            }
+            if window_rows >= COPY_OBJECT_SCAN_ROWS {
+                break (pair, cols);
+            }
+            window_rows = window_rows.saturating_mul(2).min(COPY_OBJECT_SCAN_ROWS);
+        };
+        let (opener, closer) = pair?;
+        if !inside {
+            return Some((opener.start, closer.end));
+        }
+        let start = if opener.end.col.saturating_add(1) < cols {
+            TerminalTextPoint {
+                row: opener.end.row,
+                col: opener.end.col.saturating_add(1),
+            }
+        } else {
+            TerminalTextPoint {
+                row: opener.end.row.saturating_add(1),
+                col: 0,
+            }
+        };
+        let end = if closer.start.col > 0 {
+            TerminalTextPoint {
+                row: closer.start.row,
+                col: closer.start.col.saturating_sub(1),
+            }
+        } else {
+            TerminalTextPoint {
+                row: closer.start.row.saturating_sub(1),
+                col: cols.saturating_sub(1),
+            }
+        };
+        (start <= end).then_some((start, end))
+    }
+
+    pub(crate) fn word_object_range(
+        &self,
+        row: u32,
+        col: u16,
+        big: bool,
+        inside: bool,
+    ) -> Option<(TerminalTextPoint, TerminalTextPoint)> {
+        let core = self.ghostty.core.lock().ok()?;
+        let cols = core.terminal.cols().ok()?;
+        let total_rows = core.terminal.total_rows().ok()?;
+        let current = usize::try_from(row).ok()?;
+        if current >= total_rows {
+            return None;
+        }
+        // Snapshot an expanding window around the cursor, releasing the lock between
+        // snapshots, mirroring the enclosing-object scan.
+        let mut window_rows = 64usize;
+        loop {
+            let (start_row, end_row) = copy_object_window_bounds(current, total_rows, window_rows);
+            let rows = core
+                .terminal
+                .screen_text_rows_range(start_row, end_row)
+                .ok()?;
+            let buffer = RetainedTextBuffer::new_words(cols, rows, u32::try_from(start_row).ok()?);
+            let cursor = TerminalTextPoint { row, col };
+            if let Some((start, end, touches_edge)) = buffer.word_object_range(cursor, big, inside)
+            {
+                let reached_history_edge = start_row == 0;
+                let reached_future_edge = end_row == total_rows;
+                if !touches_edge || (reached_history_edge && reached_future_edge) {
+                    return Some((start, end));
+                }
+            }
+            if start_row == 0 && end_row == total_rows {
+                return None;
+            }
+            if window_rows >= COPY_OBJECT_SCAN_ROWS {
+                return None;
+            }
+            window_rows = window_rows.saturating_mul(2).min(COPY_OBJECT_SCAN_ROWS);
+        }
+    }
+
     fn retained_text_buffer(&self) -> Option<(RetainedTextBuffer, crate::ghostty::ActiveScreen)> {
         let (cols, rows, active_screen) = {
             let core = self.ghostty.core.lock().ok()?;
@@ -524,6 +742,13 @@ impl PaneTerminal {
 
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
         self.ghostty.extract_selection(selection)
+    }
+
+    pub fn extract_block_selection(
+        &self,
+        selection: &crate::selection::Selection,
+    ) -> Option<String> {
+        self.ghostty.extract_block_selection(selection)
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, show_cursor: bool) {
@@ -1099,6 +1324,108 @@ impl RetainedTextBuffer {
             .find(|atom| atom.point.is_some())
             .is_some_and(|atom| atom.point == Some(point))
     }
+
+    /// Word text object (viw/vaw/viW/vaW) around `cursor`. Returns the inclusive
+    /// range plus whether the selected atom span touches the buffer's first or
+    /// last atom, meaning a larger snapshot window could still change it.
+    fn word_object_range(
+        &self,
+        cursor: TerminalTextPoint,
+        big: bool,
+        inside: bool,
+    ) -> Option<(TerminalTextPoint, TerminalTextPoint, bool)> {
+        let is_word = |atom: &TextAtom| atom.class != TextClass::Whitespace;
+        let same_run = |a: &TextAtom, b: &TextAtom| {
+            if big {
+                is_word(a) && is_word(b)
+            } else {
+                a.class == b.class
+            }
+        };
+        let cursor_index = self.atoms.iter().position(|atom| {
+            atom.point.is_some_and(|point| {
+                point.row == cursor.row && cursor.col >= point.col && cursor.col <= atom.end_col
+            })
+        });
+        let start = match cursor_index {
+            Some(index) if is_word(&self.atoms[index]) => {
+                let mut start = index;
+                while start > 0
+                    && is_word(&self.atoms[start - 1])
+                    && same_run(&self.atoms[start - 1], &self.atoms[index])
+                {
+                    start -= 1;
+                }
+                start
+            }
+            _ => {
+                // The cursor sits on whitespace or past the row's text: vim scans
+                // forward for the next word atom start.
+                let mut index = match cursor_index {
+                    Some(index) => index + 1,
+                    None => self
+                        .atoms
+                        .iter()
+                        .position(|atom| atom.point.is_some_and(|point| point >= cursor))?,
+                };
+                while self.atoms.get(index).is_some_and(|atom| !is_word(atom)) {
+                    index += 1;
+                }
+                self.atoms.get(index)?;
+                index
+            }
+        };
+        let mut end = start;
+        while self
+            .atoms
+            .get(end + 1)
+            .is_some_and(|atom| is_word(atom) && same_run(atom, &self.atoms[start]))
+        {
+            end += 1;
+        }
+        let word_start = self.atoms[start].point?;
+        let word_end = TerminalTextPoint {
+            row: self.atoms[end].point?.row,
+            col: self.atoms[end].end_col,
+        };
+        let (range_start, range_end, last_index) = if inside {
+            (word_start, word_end, end)
+        } else {
+            // Around the word: include one trailing separator run when one
+            // exists, otherwise the leading separator run instead.
+            let mut after = end;
+            while self
+                .atoms
+                .get(after + 1)
+                .is_some_and(|atom| atom.point.is_some() && atom.class == TextClass::Whitespace)
+            {
+                after += 1;
+            }
+            if after > end {
+                let after_end = TerminalTextPoint {
+                    row: self.atoms[after].point?.row,
+                    col: self.atoms[after].end_col,
+                };
+                (word_start, after_end, after)
+            } else {
+                let mut before = start;
+                while before > 0
+                    && self.atoms[before - 1].point.is_some()
+                    && self.atoms[before - 1].class == TextClass::Whitespace
+                {
+                    before -= 1;
+                }
+                let before_start = if before < start {
+                    self.atoms[before].point?
+                } else {
+                    word_start
+                };
+                (before_start, word_end, end)
+            }
+        };
+        let touches_edge = start == 0 || last_index == self.atoms.len().saturating_sub(1);
+        Some((range_start, range_end, touches_edge))
+    }
 }
 
 fn terminal_cell_text(graphemes: &[u32]) -> String {
@@ -1110,6 +1437,193 @@ fn terminal_cell_text(graphemes: &[u32]) -> String {
     graphemes
         .iter()
         .map(|codepoint| char::from_u32(*codepoint).unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CopyCellPoint {
+    start: TerminalTextPoint,
+    end: TerminalTextPoint,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CopyGlyph {
+    start: TerminalTextPoint,
+    end: TerminalTextPoint,
+    ch: char,
+}
+
+fn copy_row_motion_points(
+    screen_row: &crate::ghostty::ScreenTextRow,
+    row: u32,
+) -> Vec<CopyCellPoint> {
+    screen_row
+        .cells
+        .iter()
+        .enumerate()
+        .filter(|(_, cell)| {
+            !matches!(
+                cell.wide,
+                crate::ghostty::CellWide::SpacerTail | crate::ghostty::CellWide::SpacerHead
+            )
+        })
+        .filter_map(|(cell_col, cell)| {
+            let col = u16::try_from(cell_col).ok()?;
+            let width = u16::from(cell.wide == crate::ghostty::CellWide::Wide) + 1;
+            Some(CopyCellPoint {
+                start: TerminalTextPoint { row, col },
+                end: TerminalTextPoint {
+                    row,
+                    col: col.saturating_add(width - 1),
+                },
+            })
+        })
+        .collect()
+}
+
+/// Locates the soft-wrapped logical line containing absolute row `current` in a snapshot of `rows`.
+fn snapshot_logical_line_extent(
+    rows: &[crate::ghostty::ScreenTextRow],
+    start_row: usize,
+    current: usize,
+    total_rows: usize,
+) -> (usize, usize, bool, bool) {
+    let mut line_start = current - start_row;
+    while line_start > 0 && rows.get(line_start - 1).is_some_and(|row| row.soft_wrapped) {
+        line_start -= 1;
+    }
+    let mut line_end = current - start_row;
+    while line_end + 1 < rows.len() && rows.get(line_end).is_some_and(|row| row.soft_wrapped) {
+        line_end += 1;
+    }
+    let needs_more_history =
+        line_start == 0 && start_row > 0 && rows.first().is_some_and(|row| row.wrap_continuation);
+    let needs_more_future = line_end + 1 == rows.len()
+        && start_row + line_end + 1 < total_rows
+        && rows.last().is_some_and(|row| row.soft_wrapped);
+    (line_start, line_end, needs_more_history, needs_more_future)
+}
+
+/// Hard cap for enclosing-object scan windows so every keypress does bounded work.
+const COPY_OBJECT_SCAN_ROWS: usize = 2_000;
+
+/// Snapshot window `[start_row, end_row)` for a copy-object scan, clamped to retained history.
+fn copy_object_window_bounds(
+    current: usize,
+    total_rows: usize,
+    window_rows: usize,
+) -> (usize, usize) {
+    (
+        current.saturating_sub(window_rows.saturating_sub(1)),
+        current.saturating_add(window_rows).min(total_rows),
+    )
+}
+
+/// Whether a resolved object pair is final for a window: strictly inside, or touching a hard
+/// history edge (row 0 or the last retained row) where no larger window exists.
+fn copy_object_pair_is_stable(
+    opener_start_row: usize,
+    closer_end_row: usize,
+    window_start_row: usize,
+    window_end_row: usize,
+    reached_history_edge: bool,
+    reached_future_edge: bool,
+) -> bool {
+    let last_window_row = window_end_row.saturating_sub(1);
+    (opener_start_row > window_start_row || reached_history_edge)
+        && (closer_end_row < last_window_row || reached_future_edge)
+}
+
+/// Selects the bracket pair for an enclosing-object motion: the innermost pair enclosing the
+/// cursor expanded by `depth`, or the closest pair around the next opener after it.
+fn select_object_pair(
+    glyphs: &[CopyGlyph],
+    open: char,
+    close: char,
+    cursor: TerminalTextPoint,
+    depth: usize,
+) -> Option<(usize, usize)> {
+    let mut stack = Vec::new();
+    let mut pairs = Vec::new();
+    for (index, glyph) in glyphs.iter().enumerate() {
+        if glyph.ch == open {
+            stack.push(index);
+        } else if glyph.ch == close {
+            if let Some(opener) = stack.pop() {
+                pairs.push((opener, index));
+            }
+        }
+    }
+
+    let mut candidates: Vec<(usize, usize)> = pairs
+        .iter()
+        .copied()
+        .filter(|(opener, closer)| glyphs[*opener].start <= cursor && cursor <= glyphs[*closer].end)
+        .collect();
+    candidates.sort_unstable_by_key(|pair| std::cmp::Reverse(pair.0));
+    if candidates.is_empty() {
+        let base = pairs
+            .iter()
+            .copied()
+            .filter(|(opener, _)| glyphs[*opener].start > cursor)
+            .min_by_key(|(opener, _)| *opener)?;
+        candidates = pairs
+            .iter()
+            .copied()
+            .filter(|(opener, closer)| opener <= &base.0 && closer >= &base.1)
+            .collect();
+        candidates.sort_unstable_by_key(|pair| std::cmp::Reverse(pair.0));
+    }
+    candidates.get(depth).copied()
+}
+
+/// Cell-motion points across a soft-wrapped logical line; wide cells normalize to their lead cell.
+fn copy_logical_line_motion_points(
+    rows: &[crate::ghostty::ScreenTextRow],
+    row_offset: u32,
+) -> Vec<CopyCellPoint> {
+    rows.iter()
+        .enumerate()
+        .flat_map(|(row_index, screen_row)| {
+            copy_row_motion_points(
+                screen_row,
+                row_offset.saturating_add(u32::try_from(row_index).unwrap_or(u32::MAX)),
+            )
+        })
+        .collect()
+}
+
+fn copy_glyphs(rows: &[crate::ghostty::ScreenTextRow], row_offset: u32) -> Vec<CopyGlyph> {
+    rows.iter()
+        .enumerate()
+        .flat_map(|(row_index, screen_row)| {
+            let row = row_offset.saturating_add(u32::try_from(row_index).unwrap_or(u32::MAX));
+            screen_row
+                .cells
+                .iter()
+                .enumerate()
+                .filter(|(_, cell)| {
+                    !matches!(
+                        cell.wide,
+                        crate::ghostty::CellWide::SpacerTail | crate::ghostty::CellWide::SpacerHead
+                    ) && !cell.graphemes.is_empty()
+                        && cell.graphemes.first().copied()
+                            != Some(crate::ghostty::KITTY_UNICODE_PLACEHOLDER)
+                })
+                .filter_map(move |(cell_col, cell)| {
+                    let col = u16::try_from(cell_col).ok()?;
+                    let ch = char::from_u32(*cell.graphemes.first()?)?;
+                    let width = u16::from(cell.wide == crate::ghostty::CellWide::Wide) + 1;
+                    Some(CopyGlyph {
+                        start: TerminalTextPoint { row, col },
+                        end: TerminalTextPoint {
+                            row,
+                            col: col.saturating_add(width - 1),
+                        },
+                        ch,
+                    })
+                })
+        })
         .collect()
 }
 
@@ -2275,6 +2789,16 @@ impl GhosttyPaneTerminal {
             .and_then(|mut core| ghostty_extract_selection(&mut core, selection).ok())
     }
 
+    pub fn extract_block_selection(
+        &self,
+        selection: &crate::selection::Selection,
+    ) -> Option<String> {
+        self.core
+            .lock()
+            .ok()
+            .and_then(|mut core| ghostty_extract_block_selection(&mut core, selection).ok())
+    }
+
     pub fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
         self.core
             .lock()
@@ -3010,6 +3534,15 @@ fn ghostty_extract_selection(
     let ((start_row, start_col), (end_row, end_col)) = selection.ordered_cells();
     core.terminal
         .read_text_screen((start_col, start_row), (end_col, end_row), false)
+}
+
+fn ghostty_extract_block_selection(
+    core: &mut GhosttyPaneCore,
+    selection: &crate::selection::Selection,
+) -> Result<String, crate::ghostty::Error> {
+    let ((start_row, start_col), (end_row, end_col)) = selection.ordered_cells();
+    core.terminal
+        .read_text_screen((start_col, start_row), (end_col, end_row), true)
 }
 
 fn ghostty_screen_row(
@@ -3929,6 +4462,510 @@ mod tests {
         assert_eq!(
             buffer.word_motion(0, 4, TerminalWordMotion::NextBigEnd),
             Some(TerminalTextPoint { row: 2, col: 2 })
+        );
+    }
+
+    #[test]
+    fn live_terminal_find_char_scans_forward_backward_and_till() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(16, 3, 200).unwrap();
+        terminal.write(b"hello world foo");
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap());
+
+        assert_eq!(
+            pane.find_char_target(0, 1, 'o', true, false, 1, false),
+            Some(TerminalTextPoint { row: 0, col: 4 })
+        );
+        assert_eq!(
+            pane.find_char_target(0, 1, 'o', true, true, 1, false),
+            Some(TerminalTextPoint { row: 0, col: 3 })
+        );
+        assert_eq!(
+            pane.find_char_target(0, 7, 'o', false, false, 1, false),
+            Some(TerminalTextPoint { row: 0, col: 4 })
+        );
+        assert_eq!(
+            pane.find_char_target(0, 7, 'o', false, true, 1, false),
+            Some(TerminalTextPoint { row: 0, col: 5 })
+        );
+        assert_eq!(
+            pane.find_char_target(0, 1, 'z', true, false, 1, false),
+            None
+        );
+    }
+
+    #[test]
+    fn live_terminal_find_counts_and_repeats_till_atomically() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(16, 3, 200).unwrap();
+        terminal.write(b"a x x");
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap());
+
+        assert_eq!(
+            pane.find_char_target(0, 0, 'x', true, true, 1, false),
+            Some(TerminalTextPoint { row: 0, col: 1 })
+        );
+        assert_eq!(
+            pane.find_char_target(0, 1, 'x', true, true, 1, true),
+            Some(TerminalTextPoint { row: 0, col: 3 })
+        );
+        assert_eq!(
+            pane.find_char_target(0, 0, 'x', true, true, 2, false),
+            Some(TerminalTextPoint { row: 0, col: 3 })
+        );
+        assert_eq!(
+            pane.find_char_target(0, 0, 'x', true, false, 3, false),
+            None,
+            "an insufficient count must not return a partial target"
+        );
+    }
+
+    #[test]
+    fn live_terminal_find_char_respects_wide_and_wrapped_cells() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(8, 3, 200).unwrap();
+        terminal.write("a界x".as_bytes());
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap());
+
+        assert_eq!(
+            pane.find_char_target(0, 0, 'x', true, true, 1, false),
+            Some(TerminalTextPoint { row: 0, col: 1 })
+        );
+
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(4, 3, 200).unwrap();
+        terminal.write(b"abcdx");
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap());
+        assert_eq!(
+            pane.find_char_target(0, 0, 'x', true, true, 1, false),
+            Some(TerminalTextPoint { row: 0, col: 3 })
+        );
+
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(4, 3, 200).unwrap();
+        terminal.write(b"abcxYZ");
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap());
+        assert_eq!(
+            pane.find_char_target(1, 1, 'x', false, true, 1, false),
+            Some(TerminalTextPoint { row: 1, col: 0 })
+        );
+    }
+
+    #[test]
+    fn live_terminal_find_till_reaches_across_unwritten_blank_cells() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(16, 3, 200).unwrap();
+        terminal.write(b"ab\x1b[9Gx\x1b[12Gy");
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap());
+
+        assert_eq!(
+            pane.find_char_target(0, 0, 'x', true, true, 1, false),
+            Some(TerminalTextPoint { row: 0, col: 7 }),
+            "forward till must stop on the blank cell left of the target"
+        );
+        assert_eq!(
+            pane.find_char_target(0, 0, 'x', true, false, 1, false),
+            Some(TerminalTextPoint { row: 0, col: 8 })
+        );
+        assert_eq!(
+            pane.find_char_target(0, 11, 'x', false, true, 1, false),
+            Some(TerminalTextPoint { row: 0, col: 9 }),
+            "reverse till must stop on the blank cell right of the target"
+        );
+        assert_eq!(
+            pane.find_char_target(0, 11, 'x', false, false, 1, false),
+            Some(TerminalTextPoint { row: 0, col: 8 })
+        );
+
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(16, 3, 200).unwrap();
+        terminal.write(b"\xE7\x95\x8C\x1b[4Gx");
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap());
+        assert_eq!(
+            pane.find_char_target(0, 0, 'x', true, true, 1, false),
+            Some(TerminalTextPoint { row: 0, col: 2 })
+        );
+
+        // Reverse till after a wide target lands on the next logical cell, not one past it.
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(16, 3, 200).unwrap();
+        terminal.write("ab界y".as_bytes());
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap());
+        assert_eq!(
+            pane.find_char_target(0, 4, '界', false, true, 1, false),
+            Some(TerminalTextPoint { row: 0, col: 4 })
+        );
+        assert_eq!(
+            pane.find_char_target(0, 4, '界', false, false, 1, false),
+            Some(TerminalTextPoint { row: 0, col: 2 })
+        );
+    }
+
+    #[test]
+    fn live_terminal_find_till_crosses_soft_wrap_over_blank_cells() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(4, 3, 200).unwrap();
+        // Row 1 gets "y" at an unwritten blank col 1, then "z" at col 2 via cursor positioning.
+        terminal.write(b"abcxy\x1b[2;3Hz");
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap());
+
+        assert_eq!(
+            pane.find_char_target(0, 0, 'z', true, true, 1, false),
+            Some(TerminalTextPoint { row: 1, col: 1 }),
+            "forward till across the wrap must stop on the blank cell"
+        );
+        assert_eq!(
+            pane.find_char_target(1, 3, 'y', false, true, 1, false),
+            Some(TerminalTextPoint { row: 1, col: 1 }),
+            "reverse till across the wrap must stop on the blank cell"
+        );
+    }
+
+    #[test]
+    fn snapshot_logical_line_extent_short_line_does_not_expand_with_unrelated_history() {
+        let rows: Vec<crate::ghostty::ScreenTextRow> = (0..64)
+            .map(|row| {
+                text_row(
+                    if row == 32 {
+                        vec![text_cell("x")]
+                    } else {
+                        vec![text_cell("a")]
+                    },
+                    false,
+                )
+            })
+            .collect();
+        let (line_start, line_end, needs_more_history, needs_more_future) =
+            snapshot_logical_line_extent(&rows, 10_000, 10_032, 1_000_000);
+        assert_eq!((line_start, line_end), (32, 32));
+        assert!(!needs_more_history);
+        assert!(!needs_more_future);
+    }
+
+    #[test]
+    fn snapshot_logical_line_extent_expands_only_past_snapshot_wrap_boundaries() {
+        let cells = "abcd".chars().map(|ch| text_cell(&ch.to_string()));
+        let continuation = |soft_wrapped: bool| crate::ghostty::ScreenTextRow {
+            cells: cells.clone().collect(),
+            soft_wrapped,
+            wrap_continuation: true,
+        };
+        let terminated = |soft_wrapped: bool| text_row(cells.clone(), soft_wrapped);
+
+        let rows = vec![continuation(false), terminated(false)];
+        let (_, _, needs_more_history, _) = snapshot_logical_line_extent(&rows, 500, 500, 1_000);
+        assert!(needs_more_history);
+
+        let (_, _, needs_more_history, _) = snapshot_logical_line_extent(&rows, 0, 0, 1_000);
+        assert!(!needs_more_history);
+
+        let rows = vec![terminated(true), continuation(true)];
+        let (_, _, _, needs_more_future) = snapshot_logical_line_extent(&rows, 500, 500, 1_000);
+        assert!(needs_more_future);
+
+        let rows = vec![terminated(true), continuation(false)];
+        let (_, line_end, _, needs_more_future) =
+            snapshot_logical_line_extent(&rows, 500, 500, 502);
+        assert_eq!(line_end, 1);
+        assert!(!needs_more_future);
+
+        let rows = vec![terminated(true), continuation(false), terminated(false)];
+        let (line_start, line_end, needs_more_history, needs_more_future) =
+            snapshot_logical_line_extent(&rows, 500, 501, 1_000);
+        assert_eq!((line_start, line_end), (0, 1));
+        assert!(!needs_more_history);
+        assert!(!needs_more_future);
+    }
+
+    #[test]
+    fn live_terminal_find_char_short_line_in_deep_scrollback_resolves_from_window() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(4, 3, 1_000).unwrap();
+        terminal.write(b"axx\r\n");
+        for _ in 0..600 {
+            terminal.write(b"bbbb\r\n");
+        }
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap());
+
+        assert_eq!(
+            pane.find_char_target(0, 0, 'x', true, false, 1, false),
+            Some(TerminalTextPoint { row: 0, col: 1 })
+        );
+        assert_eq!(
+            pane.find_char_target(0, 2, 'x', false, false, 1, false),
+            Some(TerminalTextPoint { row: 0, col: 1 })
+        );
+    }
+
+    #[test]
+    fn copy_glyphs_skip_padding_and_kitty_placeholders_but_keep_explicit_spaces() {
+        let row = text_row(
+            [
+                text_cell("a"),
+                text_cell(" "),
+                crate::ghostty::ScreenTextCell {
+                    wide: crate::ghostty::CellWide::Narrow,
+                    graphemes: vec![crate::ghostty::KITTY_UNICODE_PLACEHOLDER],
+                },
+                crate::ghostty::ScreenTextCell {
+                    wide: crate::ghostty::CellWide::Narrow,
+                    graphemes: Vec::new(),
+                },
+                text_cell("x"),
+            ],
+            false,
+        );
+        let glyphs = copy_glyphs(&[row], 0);
+        assert_eq!(
+            glyphs.iter().map(|glyph| glyph.ch).collect::<String>(),
+            "a x"
+        );
+        assert_eq!(glyphs[1].start.col, 1);
+        assert_eq!(glyphs[2].start.col, 4);
+    }
+
+    #[test]
+    fn live_terminal_enclosing_object_range_selects_innermost_pair() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(16, 3, 200).unwrap();
+        terminal.write(b"(a (b) c)");
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap());
+
+        assert_eq!(
+            pane.enclosing_object_range(0, 4, '(', ')', true, 1),
+            Some((
+                TerminalTextPoint { row: 0, col: 4 },
+                TerminalTextPoint { row: 0, col: 4 }
+            ))
+        );
+        assert_eq!(
+            pane.enclosing_object_range(0, 4, '(', ')', false, 1),
+            Some((
+                TerminalTextPoint { row: 0, col: 3 },
+                TerminalTextPoint { row: 0, col: 5 }
+            ))
+        );
+        assert_eq!(
+            pane.enclosing_object_range(0, 5, '(', ')', false, 1),
+            Some((
+                TerminalTextPoint { row: 0, col: 3 },
+                TerminalTextPoint { row: 0, col: 5 }
+            ))
+        );
+        assert_eq!(
+            pane.enclosing_object_range(0, 0, '(', ')', false, 1),
+            Some((
+                TerminalTextPoint { row: 0, col: 0 },
+                TerminalTextPoint { row: 0, col: 8 }
+            ))
+        );
+        assert_eq!(
+            pane.enclosing_object_range(0, 4, '(', ')', true, 2),
+            Some((
+                TerminalTextPoint { row: 0, col: 1 },
+                TerminalTextPoint { row: 0, col: 7 }
+            ))
+        );
+        assert_eq!(pane.enclosing_object_range(0, 4, '{', '}', false, 1), None);
+
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(16, 3, 200).unwrap();
+        terminal.write(b"xx (one)");
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap());
+        assert_eq!(
+            pane.enclosing_object_range(0, 0, '(', ')', true, 1),
+            Some((
+                TerminalTextPoint { row: 0, col: 4 },
+                TerminalTextPoint { row: 0, col: 6 }
+            )),
+            "when no pair encloses the cursor, use the next opener"
+        );
+    }
+
+    #[test]
+    fn live_terminal_word_object_range_selects_the_word_under_the_cursor() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(12, 3, 200).unwrap();
+        terminal.write(b"foo.bar qux");
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap());
+
+        // viw on 'b' of bar selects the small word.
+        assert_eq!(
+            pane.word_object_range(0, 4, false, true),
+            Some((
+                TerminalTextPoint { row: 0, col: 4 },
+                TerminalTextPoint { row: 0, col: 6 }
+            ))
+        );
+        // viw on a separator atom selects the separator run.
+        assert_eq!(
+            pane.word_object_range(0, 3, false, true),
+            Some((
+                TerminalTextPoint { row: 0, col: 3 },
+                TerminalTextPoint { row: 0, col: 3 }
+            ))
+        );
+        // viw on whitespace scans forward to the next word, like vim.
+        assert_eq!(
+            pane.word_object_range(0, 7, false, true),
+            Some((
+                TerminalTextPoint { row: 0, col: 8 },
+                TerminalTextPoint { row: 0, col: 10 }
+            ))
+        );
+        // vaw from 'q' of qux includes the trailing separator run ("qux ").
+        assert_eq!(
+            pane.word_object_range(0, 8, false, false),
+            Some((
+                TerminalTextPoint { row: 0, col: 8 },
+                TerminalTextPoint { row: 0, col: 11 }
+            ))
+        );
+        // vaW includes the trailing whitespace after the big word.
+        assert_eq!(
+            pane.word_object_range(0, 0, true, false),
+            Some((
+                TerminalTextPoint { row: 0, col: 0 },
+                TerminalTextPoint { row: 0, col: 7 }
+            ))
+        );
+        // viW treats the whole non-whitespace run as one word.
+        assert_eq!(
+            pane.word_object_range(0, 4, true, true),
+            Some((
+                TerminalTextPoint { row: 0, col: 0 },
+                TerminalTextPoint { row: 0, col: 6 }
+            ))
+        );
+        // Whitespace past the last word with no following word finds nothing.
+        assert_eq!(pane.word_object_range(0, 11, false, true), None);
+    }
+
+    #[test]
+    fn live_terminal_word_object_range_round_trips_wide_cells() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(12, 3, 200).unwrap();
+        terminal.write("a好b".as_bytes());
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap());
+
+        // The cursor on the wide lead cell and on its spacer tail both select
+        // the containing word, whose range covers the wide glyph.
+        for col in [1u16, 2] {
+            assert_eq!(
+                pane.word_object_range(0, col, false, true),
+                Some((
+                    TerminalTextPoint { row: 0, col: 0 },
+                    TerminalTextPoint { row: 0, col: 3 }
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn live_terminal_enclosing_object_range_counts_depth_across_rows() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(16, 3, 200).unwrap();
+        terminal.write(b"{ a\r\n(b) }\r\n{}");
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap());
+
+        // The parens are nested inside the braces and must be skipped when looking for the closer.
+        assert_eq!(
+            pane.enclosing_object_range(1, 1, '{', '}', false, 1),
+            Some((
+                TerminalTextPoint { row: 0, col: 0 },
+                TerminalTextPoint { row: 1, col: 4 }
+            ))
+        );
+
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(16, 3, 200).unwrap();
+        terminal.write(b"{\r\n\r\n}");
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap());
+        assert_eq!(
+            pane.enclosing_object_range(1, 0, '{', '}', true, 1),
+            Some((
+                TerminalTextPoint { row: 0, col: 1 },
+                TerminalTextPoint { row: 1, col: 15 }
+            )),
+            "inside a multiline empty object must retain the intervening newline"
+        );
+    }
+
+    #[test]
+    fn live_terminal_find_has_no_fixed_soft_wrap_cutoff() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(4, 3, 1_000).unwrap();
+        terminal.write(format!("{}x", "a".repeat(1_604)).as_bytes());
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap());
+
+        let target = pane
+            .find_char_target(0, 0, 'x', true, false, 1, false)
+            .expect("target beyond the old 400-row cutoff");
+        assert!(target.row > 400);
+    }
+
+    #[test]
+    fn live_terminal_enclosing_object_range_has_no_fixed_row_cutoff() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(8, 3, 1_000).unwrap();
+        terminal.write(b"{\r\n");
+        for _ in 0..450 {
+            terminal.write(b"x\r\n");
+        }
+        terminal.write(b"}");
+        let last_row = terminal.total_rows().unwrap().saturating_sub(1) as u32;
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap());
+
+        assert_eq!(
+            pane.enclosing_object_range(225, 0, '{', '}', false, 1),
+            Some((
+                TerminalTextPoint { row: 0, col: 0 },
+                TerminalTextPoint {
+                    row: last_row,
+                    col: 0
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn copy_object_window_resolves_near_cursor_pair_on_first_iteration_with_huge_history() {
+        assert_eq!(
+            copy_object_window_bounds(500_000, 1_000_000, 64),
+            (499_937, 500_064)
+        );
+        assert!(copy_object_pair_is_stable(
+            500_000, 500_001, 499_937, 500_064, false, false
+        ));
+        assert!(!copy_object_pair_is_stable(
+            499_937, 500_001, 499_937, 500_064, false, false
+        ));
+        assert!(!copy_object_pair_is_stable(
+            500_000, 500_063, 499_937, 500_064, false, false
+        ));
+        assert!(copy_object_pair_is_stable(
+            499_937, 500_001, 499_937, 500_064, true, false
+        ));
+        assert!(copy_object_pair_is_stable(
+            500_000, 500_063, 499_937, 500_064, false, true
+        ));
+    }
+
+    #[test]
+    fn live_terminal_enclosing_object_range_unbalanced_opener_beyond_cap_returns_none() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(8, 3, 10_000).unwrap();
+        terminal.write(b"(\r\n");
+        for _ in 0..3_000 {
+            terminal.write(b"x\r\n");
+        }
+        let total_rows = terminal.total_rows().unwrap();
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap());
+        assert!(total_rows > COPY_OBJECT_SCAN_ROWS);
+
+        assert_eq!(
+            pane.enclosing_object_range((total_rows - 1) as u32, 0, '(', ')', false, 1),
+            None
         );
     }
 

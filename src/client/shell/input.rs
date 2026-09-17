@@ -130,7 +130,7 @@ impl ClientShellState {
 
     fn prepare_committed_text(&mut self, text: &str, outcome: &mut ClientShellInput) -> bool {
         if !(self.mode == ClientShellMode::Navigate && self.workspace_preview_action_blocked())
-            && self.insert_copy_search_text(text)
+            && self.insert_copy_search_text(text, outcome)
         {
             outcome.repaint = true;
             return true;
@@ -305,8 +305,20 @@ impl ClientShellState {
     ) {
         outcome.repaint |= self.clear_link_hover();
         if self.copy_operation_in_flight {
-            self.copy_input_queue.push_back(key);
-            return;
+            // Search-prompt keys stay live while a copy search is in flight so edits can
+            // supersede the pending query.
+            let prompt_open = self
+                .copy_mode
+                .as_ref()
+                .is_some_and(|copy_mode| copy_mode.search_prompt.is_some());
+            // Esc must stay responsive in copy mode: cancellation input cannot park behind
+            // in-flight repeat pipelines.
+            let cancel_key =
+                self.mode == ClientShellMode::Copy && !prompt_open && key.code == KeyCode::Esc;
+            if !prompt_open && !cancel_key {
+                self.copy_input_queue.push_back(key);
+                return;
+            }
         }
         let lease_key = crate::input::InputLeaseKey::new(LOCAL_INPUT_SOURCE, &key);
         let key = self.input_leases.normalize_press(&lease_key, key);
@@ -491,7 +503,8 @@ impl ClientShellState {
             return false;
         }
         if let Some(text) = read_clipboard_text() {
-            let inserted = self.insert_copy_search_text(&text) || self.insert_overlay_text(&text);
+            let inserted =
+                self.insert_copy_search_text(&text, outcome) || self.insert_overlay_text(&text);
             outcome.repaint |= inserted;
         }
         true
