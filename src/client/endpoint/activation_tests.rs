@@ -228,6 +228,234 @@ fn surface(boot_id: &str, revision: u64, pane: &str) -> crate::protocol::PaneSur
     }
 }
 
+#[test]
+fn presentation_sync_commit_unfreezes_pane_input_before_effects_fence() {
+    let mut state = crate::client::ClientState::test_new();
+    let target = endpoint();
+    {
+        let shell = state.shell.as_mut().expect("test client shell");
+        shell.set_endpoint_catalog(&[super::super::SavedSshEndpoint {
+            id: super::super::ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+            label: "Remote".into(),
+            target: "dev@example.com".into(),
+            session: "main".into(),
+            enabled: true,
+        }]);
+        shell.set_snapshot(Box::new(test_snapshot("local-boot", 1)));
+        shell.set_endpoint_status(&target, ClientEndpointStatus::Online);
+        shell.set_endpoint_snapshot(&target, Box::new(test_snapshot("remote-boot", 1)));
+    }
+    let mut endpoints = EndpointRegistry::new(
+        FakeTransport {
+            sent: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_after_write: false,
+        },
+        1,
+        negotiation(),
+    );
+    endpoints.insert(
+        target.clone(),
+        FakeTransport {
+            sent: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_after_write: false,
+        },
+        7,
+        negotiation(),
+        false,
+    );
+    let mut pending = Some(machine());
+    if let Some(activation) = pending.as_mut() {
+        if let ActivationPhase::ActivatingTarget { evidence, .. } = &mut activation.phase {
+            evidence.surface = Some(surface("remote-boot", 1, "pane"));
+        }
+    }
+    let mut commands = crate::client::endpoint_commands::EndpointCommands::default();
+
+    crate::client::shell_runtime::complete_endpoint_activation(
+        &mut state,
+        &mut endpoints,
+        &mut pending,
+        &mut commands,
+    )
+    .unwrap();
+    assert!(
+        endpoints.active_surface_available(),
+        "pane input resumes at the coherent presentation commit"
+    );
+    assert!(
+        pending.is_some(),
+        "presentation effects sync is still pending after the commit"
+    );
+
+    if let Some(activation) = pending.as_mut() {
+        activation.phase = ActivationPhase::AwaitingPresentationEffects {
+            lease: lease(target, 7, "remote-boot"),
+            token: "epoch:7:remote-boot".into(),
+            ready: true,
+            completion: Box::new(ActivationCompletion::Activated),
+        };
+    }
+    crate::client::shell_runtime::complete_endpoint_activation(
+        &mut state,
+        &mut endpoints,
+        &mut pending,
+        &mut commands,
+    )
+    .unwrap();
+    assert!(pending.is_none(), "fence completion retires the activation");
+    assert!(
+        endpoints.active_surface_available(),
+        "fence completion must not re-freeze pane input"
+    );
+}
+
+#[test]
+fn rollback_presentation_sync_keeps_input_frozen_until_source_restore_completes() {
+    let mut state = crate::client::ClientState::test_new();
+    let local = ClientEndpointId::Local;
+    if let Some(shell) = state.shell.as_mut() {
+        shell.set_endpoint_status(&local, ClientEndpointStatus::Online);
+        shell.set_snapshot(Box::new(test_snapshot("local-boot", 1)));
+    }
+    let mut endpoints = EndpointRegistry::new(
+        FakeTransport {
+            sent: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_after_write: false,
+        },
+        1,
+        negotiation(),
+    );
+    endpoints.insert(
+        endpoint(),
+        FakeTransport {
+            sent: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_after_write: false,
+        },
+        7,
+        negotiation(),
+        false,
+    );
+    // Model the rollback's frozen handoff: begin() froze the registry before the target failed.
+    endpoints.freeze_input();
+    let mut activation = machine();
+    activation.rollback_error = Some("endpoint handoff was rolled back".into());
+    activation.phase = ActivationPhase::RestoringSource {
+        request_id: "client-shell-surface:3:rollback-source-on".into(),
+        acknowledged_revision: Some(1),
+        evidence: ActivationEvidence::default(),
+    };
+    if let ActivationPhase::RestoringSource { evidence, .. } = &mut activation.phase {
+        evidence.surface = Some(surface("local-boot", 1, "pane"));
+    }
+    let mut pending = Some(activation);
+    let mut commands = crate::client::endpoint_commands::EndpointCommands::default();
+
+    crate::client::shell_runtime::complete_endpoint_activation(
+        &mut state,
+        &mut endpoints,
+        &mut pending,
+        &mut commands,
+    )
+    .unwrap();
+    assert!(
+        !endpoints.active_surface_available(),
+        "rollback synchronization restores the source but must keep pane input parked"
+    );
+    assert!(
+        pending.is_some(),
+        "the rollback effects fence is still pending after the source restoration commit"
+    );
+
+    if let Some(activation) = pending.as_mut() {
+        activation.phase = ActivationPhase::AwaitingPresentationEffects {
+            lease: lease(local.clone(), 1, "local-boot"),
+            token: "3:1:local-boot".into(),
+            ready: true,
+            completion: Box::new(ActivationCompletion::RestoredSource {
+                error: "endpoint handoff was rolled back".into(),
+                successor: None,
+            }),
+        };
+    }
+    crate::client::shell_runtime::complete_endpoint_activation(
+        &mut state,
+        &mut endpoints,
+        &mut pending,
+        &mut commands,
+    )
+    .unwrap();
+    assert!(pending.is_none(), "fence completion retires the rollback");
+    assert!(
+        endpoints.active_surface_available(),
+        "the final RestoredSource branch unfreezes pane input once the source is restored"
+    );
+}
+
+#[test]
+fn committed_to_target_excludes_rollback_presentation_synchronization() {
+    let rollback_sync = machine();
+    assert!(
+        !rollback_sync.committed_to_target(),
+        "pre-commit phases park pane input"
+    );
+
+    let mut rollback_restoring_source = machine();
+    rollback_restoring_source.phase = ActivationPhase::SynchronizingPresentation {
+        lease: lease(ClientEndpointId::Local, 1, "local-boot"),
+        request_id: "client-shell-surface:3:presentation-sync".into(),
+        acknowledged_revision: Some(2),
+        evidence: ActivationEvidence::default(),
+        completion: Box::new(ActivationCompletion::RestoredSource {
+            error: "endpoint handoff was rolled back".into(),
+            successor: None,
+        }),
+    };
+    assert!(
+        !rollback_restoring_source.committed_to_target(),
+        "rollback synchronization restores the source and must keep pane input parked"
+    );
+
+    let mut rollback_effects_fence = machine();
+    rollback_effects_fence.phase = ActivationPhase::AwaitingPresentationEffects {
+        lease: lease(ClientEndpointId::Local, 1, "local-boot"),
+        token: "3:1:local-boot".into(),
+        ready: false,
+        completion: Box::new(ActivationCompletion::RestoredSource {
+            error: "endpoint handoff was rolled back".into(),
+            successor: None,
+        }),
+    };
+    assert!(
+        !rollback_effects_fence.committed_to_target(),
+        "rollback effects fence restores the source and must keep pane input parked"
+    );
+
+    let mut target_sync = machine();
+    target_sync.phase = ActivationPhase::SynchronizingPresentation {
+        lease: lease(endpoint(), 7, "remote-boot"),
+        request_id: "client-shell-surface:3:presentation-sync".into(),
+        acknowledged_revision: Some(2),
+        evidence: ActivationEvidence::default(),
+        completion: Box::new(ActivationCompletion::Activated),
+    };
+    assert!(
+        target_sync.committed_to_target(),
+        "target-commit synchronization may resume pane input"
+    );
+
+    let mut target_effects_fence = machine();
+    target_effects_fence.phase = ActivationPhase::AwaitingPresentationEffects {
+        lease: lease(endpoint(), 7, "remote-boot"),
+        token: "3:7:remote-boot".into(),
+        ready: false,
+        completion: Box::new(ActivationCompletion::Activated),
+    };
+    assert!(
+        target_effects_fence.committed_to_target(),
+        "target-commit effects fence may resume pane input"
+    );
+}
+
 fn machine() -> PendingEndpointActivation {
     PendingEndpointActivation {
         source: lease(ClientEndpointId::Local, 1, "local-boot"),
@@ -1115,7 +1343,7 @@ fn local_escape(source_state: &str) {
     assert_ne!(endpoints.active_id(), &disconnected);
     assert!(
         !endpoints.active_surface_available(),
-        "runtime opens input only after the effects fence"
+        "the raw activation machine never unfreezes input; the runtime opens pane input at the coherent commit"
     );
 }
 
