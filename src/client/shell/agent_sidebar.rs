@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use crate::protocol::ClientShellAgent;
+
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -17,21 +19,42 @@ pub(super) struct AgentRow {
     pub(super) rows: Vec<Vec<crate::ui::ResolvedToken>>,
 }
 
+pub(super) struct AgentGroupRow {
+    pub(super) pane_id: String,
+    pub(super) label: String,
+    pub(super) status: crate::api::schema::AgentStatus,
+    pub(super) collapsed: bool,
+}
+
+pub(super) enum AgentPanelRow {
+    Group(AgentGroupRow),
+    Agent(AgentRow),
+}
+
 pub(super) fn ordered_agent_pane_ids(
     snapshot: &ClientShellSnapshot,
     sort: crate::config::AgentPanelSortConfig,
 ) -> Vec<String> {
+    ordered_agents(snapshot, sort)
+        .into_iter()
+        .map(|agent| agent.pane_id.clone())
+        .collect()
+}
+
+pub(super) fn ordered_agents(
+    snapshot: &ClientShellSnapshot,
+    sort: crate::config::AgentPanelSortConfig,
+) -> Vec<&ClientShellAgent> {
     if snapshot.agent_view_label.is_some() {
         return snapshot
             .agent_order
             .iter()
-            .filter(|pane_id| {
+            .filter_map(|pane_id| {
                 snapshot
                     .agents
                     .iter()
-                    .any(|agent| agent.pane_id == pane_id.as_str())
+                    .find(|agent| agent.pane_id == pane_id.as_str())
             })
-            .cloned()
             .collect();
     }
     let mut agents = snapshot.agents.iter().collect::<Vec<_>>();
@@ -44,9 +67,14 @@ pub(super) fn ordered_agent_pane_ids(
         });
     }
     agents
-        .into_iter()
-        .map(|agent| agent.pane_id.clone())
-        .collect()
+}
+
+pub(super) fn aggregate_agent_status(
+    statuses: impl Iterator<Item = crate::api::schema::AgentStatus>,
+) -> crate::api::schema::AgentStatus {
+    statuses
+        .max_by_key(|status| status_priority(*status))
+        .unwrap_or(crate::api::schema::AgentStatus::Unknown)
 }
 
 pub(super) fn render_agent_panel(
@@ -54,6 +82,7 @@ pub(super) fn render_agent_panel(
     area: Rect,
     snapshot: &ClientShellSnapshot,
     config: &ClientShellConfig,
+    collapsed_agent_groups: &HashSet<String>,
     agent_scroll: &mut usize,
     hits: &mut ShellHitMap,
 ) {
@@ -67,7 +96,7 @@ pub(super) fn render_agent_panel(
         return;
     }
 
-    let rows = agent_rows(snapshot, config, None);
+    let rows = agent_panel_rows(snapshot, config, collapsed_agent_groups);
     render_agent_list(
         buffer,
         area,
@@ -79,12 +108,83 @@ pub(super) fn render_agent_panel(
         config,
         agent_scroll,
         hits,
-        |row| row.rows.len(),
-        |buffer, rect, row, hits| {
-            hits.agents.push((rect, row.pane_id.clone()));
-            render_agent_row(buffer, rect, row, config);
+        |row| match row {
+            AgentPanelRow::Group(_) => 1,
+            AgentPanelRow::Agent(row) => row.rows.len(),
+        },
+        |buffer, rect, row, hits| match row {
+            AgentPanelRow::Group(group) => {
+                hits.agent_group_toggles.push((rect, group.pane_id.clone()));
+                render_agent_group_row(buffer, rect, group, config);
+            }
+            AgentPanelRow::Agent(row) => {
+                hits.agents.push((rect, row.pane_id.clone()));
+                render_agent_row(buffer, rect, row, config);
+            }
         },
     );
+}
+
+fn agent_panel_rows(
+    snapshot: &ClientShellSnapshot,
+    config: &ClientShellConfig,
+    collapsed_agent_groups: &HashSet<String>,
+) -> Vec<AgentPanelRow> {
+    let agents = ordered_agents(snapshot, config.agent_panel_sort);
+    if snapshot.agent_view_label.is_some()
+        || config.agent_panel_sort == crate::config::AgentPanelSortConfig::Priority
+    {
+        return agents
+            .into_iter()
+            .filter_map(|agent| agent_row(snapshot, agent, config, None))
+            .map(AgentPanelRow::Agent)
+            .collect();
+    }
+    let mut groups: Vec<(AgentGroupRow, Vec<AgentRow>)> = Vec::new();
+    for agent in agents {
+        let Some(row) = agent_row(snapshot, agent, config, None) else {
+            continue;
+        };
+        if let Some((_, members)) = groups
+            .iter_mut()
+            .find(|(group, _)| group.pane_id == row.pane_id)
+        {
+            members.push(row);
+        } else {
+            groups.push((
+                AgentGroupRow {
+                    pane_id: row.pane_id.clone(),
+                    label: agent_group_label(snapshot, agent),
+                    status: crate::api::schema::AgentStatus::Unknown,
+                    collapsed: collapsed_agent_groups.contains(&row.pane_id),
+                },
+                vec![row],
+            ));
+        }
+    }
+    let mut rows = Vec::new();
+    for (group, members) in groups {
+        let collapsed = group.collapsed;
+        rows.push(AgentPanelRow::Group(AgentGroupRow {
+            status: aggregate_agent_status(members.iter().map(|row| row.status)),
+            ..group
+        }));
+        if !collapsed {
+            rows.extend(members.into_iter().map(AgentPanelRow::Agent));
+        }
+    }
+    rows
+}
+
+fn agent_group_label(snapshot: &ClientShellSnapshot, agent: &ClientShellAgent) -> String {
+    snapshot
+        .panes
+        .iter()
+        .find(|pane| pane.pane_id == agent.pane_id)
+        .and_then(|pane| pane.label.as_deref())
+        .or(agent.title.as_deref())
+        .map(str::to_owned)
+        .unwrap_or_else(|| agent.pane_id.clone())
 }
 
 pub(super) fn render_agent_panel_header(
@@ -234,27 +334,12 @@ pub(super) fn render_agent_list<T>(
     }
 }
 
-pub(super) fn agent_rows(
-    snapshot: &ClientShellSnapshot,
-    config: &ClientShellConfig,
-    machine: Option<&str>,
-) -> Vec<AgentRow> {
-    ordered_agent_pane_ids(snapshot, config.agent_panel_sort)
-        .into_iter()
-        .filter_map(|pane_id| agent_row(snapshot, &pane_id, config, machine))
-        .collect()
-}
-
 pub(super) fn agent_row(
     snapshot: &ClientShellSnapshot,
-    pane_id: &str,
+    agent: &ClientShellAgent,
     config: &ClientShellConfig,
     machine: Option<&str>,
 ) -> Option<AgentRow> {
-    let agent = snapshot
-        .agents
-        .iter()
-        .find(|agent| agent.pane_id == pane_id)?;
     let workspace = snapshot
         .workspaces
         .iter()
@@ -371,6 +456,38 @@ pub(super) fn render_agent_row(
             buffer,
         );
     }
+}
+
+pub(super) fn render_agent_group_row(
+    buffer: &mut Buffer,
+    rect: Rect,
+    group: &AgentGroupRow,
+    config: &ClientShellConfig,
+) {
+    if rect.height == 0 {
+        return;
+    }
+    let palette = &config.palette;
+    let spans = vec![
+        ratatui::text::Span::raw(" "),
+        ratatui::text::Span::styled(
+            if group.collapsed { "▸" } else { "▾" },
+            Style::default().fg(palette.accent),
+        ),
+        ratatui::text::Span::raw(" "),
+        ratatui::text::Span::styled(
+            group.label.clone(),
+            Style::default()
+                .fg(palette.text)
+                .add_modifier(Modifier::BOLD),
+        ),
+        ratatui::text::Span::raw(" "),
+        ratatui::text::Span::styled(
+            status_icon(group.status, config.status_indicators),
+            Style::default().fg(status_color(group.status, palette)),
+        ),
+    ];
+    Paragraph::new(Line::from(spans)).render(Rect::new(rect.x, rect.y, rect.width, 1), buffer);
 }
 
 fn put_text(buffer: &mut Buffer, x: u16, y: u16, width: u16, text: &str, style: Style) {

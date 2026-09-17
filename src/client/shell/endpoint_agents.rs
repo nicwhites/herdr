@@ -109,7 +109,7 @@ fn agent_rows(
                     .filter_map(|agent| {
                         super::agent_sidebar::agent_row(
                             snapshot,
-                            &agent.pane_id,
+                            agent,
                             config,
                             Some(&endpoint.label),
                         )

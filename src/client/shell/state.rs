@@ -94,6 +94,7 @@ pub(super) struct ShellHitMap {
     pub(super) popup: Option<PaneHit>,
     pub(super) pane_splits: Vec<PaneSplitHit>,
     pub(super) agents: Vec<(Rect, String)>,
+    pub(super) agent_group_toggles: Vec<(Rect, String)>,
     pub(super) endpoint_agents: Vec<(Rect, ClientEndpointId, String)>,
     pub(super) agent_body: Rect,
     pub(super) agent_scrollbar: Rect,
@@ -859,6 +860,7 @@ pub(crate) struct ClientShellState {
     pub(super) tab_press: Option<ClientTabPress>,
     pub(super) collapsed_groups: HashSet<String>,
     pub(super) remote_collapsed_groups: HashMap<ClientEndpointId, HashSet<String>>,
+    pub(super) collapsed_agent_groups: HashSet<String>,
     pub(super) workspace_scroll: usize,
     pub(super) agent_scroll: usize,
     pub(super) tab_scroll: usize,
@@ -1020,6 +1022,7 @@ impl ClientShellState {
             workspace_press: None,
             tab_press: None,
             collapsed_groups: preferences.collapsed_groups.into_iter().collect(),
+            collapsed_agent_groups: preferences.collapsed_agent_groups.into_iter().collect(),
             remote_collapsed_groups,
             workspace_scroll: 0,
             agent_scroll: 0,
@@ -1140,6 +1143,12 @@ impl ClientShellState {
         };
         if !groups.remove(&key) {
             groups.insert(key);
+        }
+    }
+
+    pub(super) fn toggle_collapsed_agent_group(&mut self, key: String) {
+        if !self.collapsed_agent_groups.remove(&key) {
+            self.collapsed_agent_groups.insert(key);
         }
     }
 
