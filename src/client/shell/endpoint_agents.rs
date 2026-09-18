@@ -49,6 +49,7 @@ pub(super) fn render_expanded(
     endpoints: &[ClientShellEndpoint],
     active_endpoint_id: &ClientEndpointId,
     config: &ClientShellConfig,
+    collapsed_agent_groups: &HashSet<String>,
     agent_scroll: &mut usize,
     hits: &mut ShellHitMap,
 ) {
@@ -61,7 +62,13 @@ pub(super) fn render_expanded(
     ) {
         return;
     }
-    let rows = agent_rows(endpoints, active_endpoint_id, config);
+    let rows = panel_rows(
+        endpoints,
+        active_endpoint_id,
+        config,
+        agent_view_label,
+        collapsed_agent_groups,
+    );
     super::agent_sidebar::render_agent_list(
         buffer,
         area,
@@ -70,21 +77,39 @@ pub(super) fn render_expanded(
         config,
         agent_scroll,
         hits,
-        |row| row.agent.rows.len(),
-        |buffer, rect, row, hits| {
-            super::agent_sidebar::render_agent_row(buffer, rect, &row.agent, config);
-            if row.stale {
-                buffer.set_style(
-                    rect,
-                    Style::default()
-                        .fg(config.palette.overlay0)
-                        .add_modifier(Modifier::DIM),
-                );
+        |row| match row {
+            EndpointPanelRow::Group(_) => 1,
+            EndpointPanelRow::Agent(row) => row.agent.rows.len(),
+        },
+        |buffer, rect, row, hits| match row {
+            EndpointPanelRow::Group(group) => {
+                hits.agent_group_toggles
+                    .push((rect, group.group_key.clone()));
+                super::agent_sidebar::render_agent_group_row(buffer, rect, group, config);
             }
-            hits.endpoint_agents
-                .push((rect, row.endpoint_id.clone(), row.agent.pane_id.clone()));
+            EndpointPanelRow::Agent(row) => {
+                super::agent_sidebar::render_agent_row(buffer, rect, &row.agent, config);
+                if row.stale {
+                    buffer.set_style(
+                        rect,
+                        Style::default()
+                            .fg(config.palette.overlay0)
+                            .add_modifier(Modifier::DIM),
+                    );
+                }
+                hits.endpoint_agents.push((
+                    rect,
+                    row.endpoint_id.clone(),
+                    row.agent.pane_id.clone(),
+                ));
+            }
         },
     );
+}
+
+enum EndpointPanelRow {
+    Group(super::agent_sidebar::AgentGroupRow),
+    Agent(EndpointAgentRow),
 }
 
 impl ClientShellState {
@@ -97,16 +122,31 @@ impl ClientShellState {
         if body_height == 0 {
             return;
         }
-        let rows = agent_rows(&self.endpoints, &self.active_endpoint_id, &self.config);
-        let Some(target) = rows
-            .iter()
-            .position(|row| &row.endpoint_id == endpoint_id && row.agent.pane_id == pane_id)
-        else {
+        let rows = panel_rows(
+            &self.endpoints,
+            &self.active_endpoint_id,
+            &self.config,
+            self.snapshot
+                .as_deref()
+                .and_then(|snapshot| snapshot.agent_view_label.as_deref()),
+            &self.collapsed_agent_groups,
+        );
+        let Some(target) = rows.iter().position(|row| match row {
+            EndpointPanelRow::Agent(agent) => {
+                &agent.endpoint_id == endpoint_id && agent.agent.pane_id == pane_id
+            }
+            EndpointPanelRow::Group(_) => false,
+        }) else {
             return;
         };
         let heights = rows
             .iter()
-            .map(|row| row.agent.rows.len().max(1).min(u16::MAX as usize) as u16)
+            .map(|row| match row {
+                EndpointPanelRow::Group(_) => 1u16,
+                EndpointPanelRow::Agent(agent) => {
+                    agent.agent.rows.len().max(1).min(u16::MAX as usize) as u16
+                }
+            })
             .collect::<Vec<_>>();
         let mut gaps = vec![self.config.agents.row_gap; rows.len()];
         if let Some(last) = gaps.last_mut() {
@@ -129,33 +169,62 @@ struct EndpointAgentRow {
     agent: super::agent_sidebar::AgentRow,
 }
 
+fn panel_rows(
+    endpoints: &[ClientShellEndpoint],
+    active_endpoint_id: &ClientEndpointId,
+    config: &ClientShellConfig,
+    agent_view_label: Option<&str>,
+    collapsed_agent_groups: &HashSet<String>,
+) -> Vec<EndpointPanelRow> {
+    let agents = agent_rows(endpoints, active_endpoint_id, config);
+    if agent_view_label.is_some()
+        || config.agent_panel_sort == crate::config::AgentPanelSortConfig::Priority
+    {
+        return agents.into_iter().map(EndpointPanelRow::Agent).collect();
+    }
+    let mut groups: Vec<(super::agent_sidebar::AgentGroupRow, Vec<EndpointAgentRow>)> = Vec::new();
+    for agent in agents {
+        let group_key = agent.endpoint_id.storage_key();
+        if let Some((_, members)) = groups
+            .iter_mut()
+            .find(|(group, _)| group.group_key == group_key)
+        {
+            members.push(agent);
+        } else {
+            groups.push((
+                super::agent_sidebar::AgentGroupRow {
+                    group_key: group_key.clone(),
+                    label: agent.machine_label.clone(),
+                    status: crate::api::schema::AgentStatus::Unknown,
+                    collapsed: collapsed_agent_groups.contains(&group_key),
+                },
+                vec![agent],
+            ));
+        }
+    }
+    let mut rows = Vec::new();
+    for (group, members) in groups {
+        let collapsed = group.collapsed;
+        rows.push(EndpointPanelRow::Group(
+            super::agent_sidebar::AgentGroupRow {
+                status: super::agent_sidebar::aggregate_agent_status(
+                    members.iter().map(|row| row.agent.status),
+                ),
+                ..group
+            },
+        ));
+        if !collapsed {
+            rows.extend(members.into_iter().map(EndpointPanelRow::Agent));
+        }
+    }
+    rows
+}
+
 fn agent_rows(
     endpoints: &[ClientShellEndpoint],
     active_endpoint_id: &ClientEndpointId,
     config: &ClientShellConfig,
 ) -> Vec<EndpointAgentRow> {
-    let mut rendered_rows = endpoints
-        .iter()
-        .filter_map(|endpoint| {
-            endpoint.snapshot.as_deref().map(|snapshot| {
-                snapshot
-                    .agents
-                    .iter()
-                    .filter_map(|agent| {
-                        super::agent_sidebar::agent_row(
-                            snapshot,
-                            &agent.pane_id,
-                            config,
-                            Some(&endpoint.label),
-                        )
-                    })
-                    .map(|agent| ((endpoint.endpoint_id.clone(), agent.pane_id.clone()), agent))
-                    .collect::<Vec<_>>()
-            })
-        })
-        .flatten()
-        .collect::<HashMap<_, _>>();
-
     super::aggregate_navigation::aggregate_agent_rows(
         endpoints,
         active_endpoint_id,
@@ -163,8 +232,12 @@ fn agent_rows(
     )
     .into_iter()
     .filter_map(|row| {
-        let key = (row.endpoint.endpoint_id.clone(), row.agent.pane_id.clone());
-        let mut agent = rendered_rows.remove(&key)?;
+        let mut agent = super::agent_sidebar::agent_row(
+            row.endpoint.snapshot,
+            row.agent,
+            config,
+            Some(row.endpoint.label),
+        )?;
         agent.focused &= row.endpoint.endpoint_id == active_endpoint_id;
         Some(EndpointAgentRow {
             endpoint_id: row.endpoint.endpoint_id.clone(),

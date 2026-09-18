@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use crate::protocol::ClientShellAgent;
+
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -17,21 +19,37 @@ pub(super) struct AgentRow {
     pub(super) rows: Vec<Vec<crate::ui::ResolvedToken>>,
 }
 
+pub(super) struct AgentGroupRow {
+    pub(super) group_key: String,
+    pub(super) label: String,
+    pub(super) status: crate::api::schema::AgentStatus,
+    pub(super) collapsed: bool,
+}
+
 pub(super) fn ordered_agent_pane_ids(
     snapshot: &ClientShellSnapshot,
     sort: crate::config::AgentPanelSortConfig,
 ) -> Vec<String> {
+    ordered_agents(snapshot, sort)
+        .into_iter()
+        .map(|agent| agent.pane_id.clone())
+        .collect()
+}
+
+pub(super) fn ordered_agents(
+    snapshot: &ClientShellSnapshot,
+    sort: crate::config::AgentPanelSortConfig,
+) -> Vec<&ClientShellAgent> {
     if snapshot.agent_view_label.is_some() {
         return snapshot
             .agent_order
             .iter()
-            .filter(|pane_id| {
+            .filter_map(|pane_id| {
                 snapshot
                     .agents
                     .iter()
-                    .any(|agent| agent.pane_id == pane_id.as_str())
+                    .find(|agent| agent.pane_id == pane_id.as_str())
             })
-            .cloned()
             .collect();
     }
     let mut agents = snapshot.agents.iter().collect::<Vec<_>>();
@@ -44,9 +62,14 @@ pub(super) fn ordered_agent_pane_ids(
         });
     }
     agents
-        .into_iter()
-        .map(|agent| agent.pane_id.clone())
-        .collect()
+}
+
+pub(super) fn aggregate_agent_status(
+    statuses: impl Iterator<Item = crate::api::schema::AgentStatus>,
+) -> crate::api::schema::AgentStatus {
+    statuses
+        .max_by_key(|status| status_priority(*status))
+        .unwrap_or(crate::api::schema::AgentStatus::Unknown)
 }
 
 pub(super) fn render_agent_panel(
@@ -67,7 +90,10 @@ pub(super) fn render_agent_panel(
         return;
     }
 
-    let rows = agent_rows(snapshot, config, None);
+    let rows = ordered_agents(snapshot, config.agent_panel_sort)
+        .into_iter()
+        .filter_map(|agent| agent_row(snapshot, agent, config, None))
+        .collect::<Vec<_>>();
     render_agent_list(
         buffer,
         area,
@@ -234,27 +260,12 @@ pub(super) fn render_agent_list<T>(
     }
 }
 
-pub(super) fn agent_rows(
-    snapshot: &ClientShellSnapshot,
-    config: &ClientShellConfig,
-    machine: Option<&str>,
-) -> Vec<AgentRow> {
-    ordered_agent_pane_ids(snapshot, config.agent_panel_sort)
-        .into_iter()
-        .filter_map(|pane_id| agent_row(snapshot, &pane_id, config, machine))
-        .collect()
-}
-
 pub(super) fn agent_row(
     snapshot: &ClientShellSnapshot,
-    pane_id: &str,
+    agent: &ClientShellAgent,
     config: &ClientShellConfig,
     machine: Option<&str>,
 ) -> Option<AgentRow> {
-    let agent = snapshot
-        .agents
-        .iter()
-        .find(|agent| agent.pane_id == pane_id)?;
     let workspace = snapshot
         .workspaces
         .iter()
@@ -371,6 +382,38 @@ pub(super) fn render_agent_row(
             buffer,
         );
     }
+}
+
+pub(super) fn render_agent_group_row(
+    buffer: &mut Buffer,
+    rect: Rect,
+    group: &AgentGroupRow,
+    config: &ClientShellConfig,
+) {
+    if rect.height == 0 {
+        return;
+    }
+    let palette = &config.palette;
+    let spans = vec![
+        ratatui::text::Span::raw(" "),
+        ratatui::text::Span::styled(
+            if group.collapsed { "▸" } else { "▾" },
+            Style::default().fg(palette.accent),
+        ),
+        ratatui::text::Span::raw(" "),
+        ratatui::text::Span::styled(
+            group.label.clone(),
+            Style::default()
+                .fg(palette.text)
+                .add_modifier(Modifier::BOLD),
+        ),
+        ratatui::text::Span::raw(" "),
+        ratatui::text::Span::styled(
+            status_icon(group.status, config.status_indicators),
+            Style::default().fg(status_color(group.status, palette)),
+        ),
+    ];
+    Paragraph::new(Line::from(spans)).render(Rect::new(rect.x, rect.y, rect.width, 1), buffer);
 }
 
 fn put_text(buffer: &mut Buffer, x: u16, y: u16, width: u16, text: &str, style: Style) {

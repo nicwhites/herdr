@@ -132,23 +132,16 @@ pub(super) fn aggregate_agent_rows<'a>(
 
     let mut rows = cached_endpoint_snapshots(endpoints)
         .flat_map(|endpoint| {
-            super::agent_sidebar::ordered_agent_pane_ids(endpoint.snapshot, sort)
+            super::agent_sidebar::ordered_agents(endpoint.snapshot, sort)
                 .into_iter()
-                .filter_map(move |pane_id| {
-                    let agent = endpoint
-                        .snapshot
-                        .agents
-                        .iter()
-                        .find(|agent| agent.pane_id == pane_id)?;
-                    Some(AggregateAgentRow {
-                        recency: endpoint
-                            .agent_recency
-                            .get(&pane_id)
-                            .copied()
-                            .unwrap_or_default(),
-                        endpoint,
-                        agent,
-                    })
+                .map(move |agent| AggregateAgentRow {
+                    recency: endpoint
+                        .agent_recency
+                        .get(&agent.pane_id)
+                        .copied()
+                        .unwrap_or_default(),
+                    endpoint,
+                    agent,
                 })
         })
         .collect::<Vec<_>>();
