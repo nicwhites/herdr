@@ -392,19 +392,12 @@ pub(super) fn complete_endpoint_activation(
                 state.retire_endpoint_graphics(previous);
             }
         }
-        // The coherent target frame replaces the frozen source, so pane input resumes at this
-        // commit and flows to the proven target. The presentation-effects fence only replays
-        // host input modes (mouse capture, keyboard reporting) afterwards and must tolerate
-        // interleaved keystrokes. Unfreeze only when committed to the target; rollback
+        // The coherent target frame replaces the frozen source, so presentation resumes at
+        // this commit. Pane input stays parked until the presentation-effects fence has
+        // replayed the target's host input modes in the final branch below; rollback
         // synchronization stays frozen so endpoint commands keep failing fast until the
-        // source restoration fully completes below.
+        // source restoration fully completes.
         state.unfreeze_presentation();
-        if pending
-            .as_ref()
-            .is_some_and(endpoint::PendingEndpointActivation::committed_to_target)
-        {
-            endpoints.unfreeze_input();
-        }
         let (cleanup, frame) = {
             let shell = state.shell.as_mut().expect("checked client shell");
             (
@@ -780,21 +773,9 @@ pub(super) fn finish_client_shell_input(
             continue;
         }
         if pending_activation.is_some() {
-            // Non-focus host effects do not cross the frozen handoff boundary. Pane input may
-            // cross once the coherent commit has proven the target safe, so typing resumes
-            // while the presentation-effects fence is still replaying host modes.
-            let pane_input = matches!(
-                request,
-                ClientMessage::ClientShellPaneInput { .. }
-                    | ClientMessage::ClientShellPopupInput { .. }
-            );
-            if !pane_input
-                || !pending_activation
-                    .as_ref()
-                    .is_some_and(endpoint::PendingEndpointActivation::committed_to_target)
-            {
-                continue;
-            }
+            // Host input modes are not replayed until the presentation-effects fence
+            // completes, so pane input encoded for stale modes must not cross the handoff.
+            continue;
         }
         write_to_server(endpoints, &request).map_err(ClientError::ConnectionLost)?;
     }

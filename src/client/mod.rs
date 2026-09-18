@@ -121,6 +121,7 @@ use terminal_sessions::terminal_control_command_from_json;
 
 #[cfg(unix)]
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::io::{self, Write as _};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -365,6 +366,210 @@ fn run_client_with_mode(
 /// - resize poller thread → sends resize events to main loop
 /// - server reader thread → reads ServerMessages and sends to main loop
 /// - main loop: coordinates input, output, and server communication
+const MAX_SURFACE_PRESENTATION_BATCH: usize = 256;
+
+enum SurfaceUpdate {
+    Surface(crate::protocol::PaneSurfaceFrame),
+    Patch(crate::protocol::PaneSurfacePatch),
+}
+
+enum SurfacePresentation {
+    None,
+    FullFrame,
+    Patch(shell::ClientComposedSurfacePatch),
+}
+
+/// Accumulates presentation work across a burst of surface messages so one
+/// drain applies every state update but composes and presents only once.
+#[derive(Default)]
+struct SurfacePresentationBatch {
+    full_frame: bool,
+    patch: Option<shell::ClientComposedSurfacePatch>,
+}
+
+impl SurfacePresentationBatch {
+    fn observe_surface(&mut self) {
+        self.full_frame = true;
+        self.patch = None;
+    }
+
+    fn observe_patch(&mut self, patch: Option<shell::ClientComposedSurfacePatch>) {
+        match patch {
+            Some(patch) if !self.full_frame && self.patch.is_none() => self.patch = Some(patch),
+            Some(_) => {
+                self.full_frame = true;
+                self.patch = None;
+            }
+            None => self.full_frame = true,
+        }
+    }
+
+    fn resolve(self) -> SurfacePresentation {
+        if self.full_frame {
+            SurfacePresentation::FullFrame
+        } else if let Some(patch) = self.patch {
+            SurfacePresentation::Patch(patch)
+        } else {
+            SurfacePresentation::None
+        }
+    }
+
+    fn present(self, state: &mut ClientState) {
+        match self.resolve() {
+            SurfacePresentation::None => {}
+            SurfacePresentation::FullFrame => {
+                let composed = state
+                    .shell
+                    .as_mut()
+                    .and_then(|shell| shell.compose(state.reported_size.0, state.reported_size.1));
+                if let Some(frame) = composed {
+                    state.present_frame(frame);
+                }
+            }
+            SurfacePresentation::Patch(patch) => match state.present_surface_patch(patch) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let composed = state.shell.as_mut().and_then(|shell| {
+                        shell.compose(state.reported_size.0, state.reported_size.1)
+                    });
+                    if let Some(frame) = composed {
+                        state.present_frame(frame);
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, "failed to present retained pane surface patch");
+                    state.request_repaint();
+                }
+            },
+        }
+    }
+}
+
+fn apply_surface_update(
+    state: &mut ClientState,
+    update: SurfaceUpdate,
+    batch: &mut SurfacePresentationBatch,
+) -> bool {
+    match update {
+        SurfaceUpdate::Surface(surface) => {
+            if let Some(shell) = state.shell.as_mut() {
+                shell.set_pane_surface(surface);
+                batch.observe_surface();
+            }
+            false
+        }
+        SurfaceUpdate::Patch(patch) => {
+            let patch_started = crate::render_prof::timer();
+            let apply_started = crate::render_prof::timer();
+            let outcome = state
+                .shell
+                .as_mut()
+                .map(|shell| shell.apply_pane_surface_patch(patch));
+            crate::render_prof::duration_since("client_surface_patch.apply", apply_started);
+            let applied = match outcome {
+                Some(shell::ClientPaneSurfacePatchOutcome::Applied(composed)) => {
+                    batch.observe_patch(composed);
+                    true
+                }
+                _ => false,
+            };
+            crate::render_prof::duration_since("client_surface_patch.total", patch_started);
+            applied
+        }
+    }
+}
+
+fn drainable_surface_message(
+    write_stream: &endpoint::EndpointRegistry,
+    pending_activation: &Option<endpoint::PendingEndpointActivation>,
+    endpoint_id: &endpoint::ClientEndpointId,
+    generation: u64,
+    message: &crate::protocol::ServerMessage,
+) -> bool {
+    if !matches!(
+        message,
+        crate::protocol::ServerMessage::PaneSurface(_)
+            | crate::protocol::ServerMessage::PaneSurfacePatch(_)
+    ) {
+        return false;
+    }
+    if !write_stream.accepts(endpoint_id, generation) {
+        return false;
+    }
+    let endpoint_active = write_stream.active_id() == endpoint_id
+        && write_stream
+            .connection(endpoint_id)
+            .is_some_and(|connection| connection.surface_active);
+    if !endpoint_active {
+        return false;
+    }
+    !pending_activation
+        .as_ref()
+        .is_some_and(|pending| pending.accepts_endpoint(endpoint_id, generation))
+}
+
+#[allow(clippy::too_many_arguments)] // one drain step over loop-owned client state
+fn coalesce_surface_presentation(
+    state: &mut ClientState,
+    write_stream: &mut endpoint::EndpointRegistry,
+    pending_activation: &Option<endpoint::PendingEndpointActivation>,
+    event_rx: &mut tokio::sync::mpsc::Receiver<ClientLoopEvent>,
+    drained_events: &mut VecDeque<ClientLoopEvent>,
+    prefix_input_source: &mut crate::platform::RealPrefixInputSource,
+    endpoint_id: &endpoint::ClientEndpointId,
+    generation: u64,
+    now: std::time::Instant,
+    update: SurfaceUpdate,
+) {
+    let mut batch = SurfacePresentationBatch::default();
+    let mut saw_patch = apply_surface_update(state, update, &mut batch);
+    apply_client_shell_input_source_changes(state, prefix_input_source);
+    let mut batched = 0_usize;
+    while batched < MAX_SURFACE_PRESENTATION_BATCH {
+        let Ok(event) = event_rx.try_recv() else {
+            break;
+        };
+        let drainable = match &event {
+            ClientLoopEvent::ServerMessage {
+                endpoint_id: message_endpoint,
+                generation: message_generation,
+                message,
+            } => {
+                message_endpoint == endpoint_id
+                    && *message_generation == generation
+                    && drainable_surface_message(
+                        write_stream,
+                        pending_activation,
+                        endpoint_id,
+                        generation,
+                        message.as_ref(),
+                    )
+            }
+            _ => false,
+        };
+        if !drainable {
+            drained_events.push_back(event);
+            break;
+        }
+        let ClientLoopEvent::ServerMessage { message, .. } = event else {
+            continue;
+        };
+        write_stream.received(endpoint_id, generation, now);
+        batched += 1;
+        let update = match *message {
+            crate::protocol::ServerMessage::PaneSurface(surface) => SurfaceUpdate::Surface(surface),
+            crate::protocol::ServerMessage::PaneSurfacePatch(patch) => SurfaceUpdate::Patch(patch),
+            _ => continue,
+        };
+        saw_patch |= apply_surface_update(state, update, &mut batch);
+        apply_client_shell_input_source_changes(state, prefix_input_source);
+    }
+    batch.present(state);
+    if saw_patch {
+        crate::render_prof::flush_if_due();
+    }
+}
+
 async fn run_client_loop(
     initial: Option<(LocalStream, handshake::HandshakeResult)>,
     mut endpoint_catalog: endpoint::EndpointCatalog,
@@ -585,6 +790,7 @@ async fn run_client_loop(
     let mut pending_activation: Option<endpoint::PendingEndpointActivation> = None;
     let mut scheduled_activation = None;
     let mut pending_catalog: Option<Result<Vec<endpoint::SavedSshEndpoint>, String>> = None;
+    let mut drained_events: VecDeque<ClientLoopEvent> = VecDeque::new();
     if state.shell.is_some() && !is_remote_client && state.attach_escape.is_none() {
         catalog_reload::watch_profiles(event_tx.clone(), should_quit.clone());
     }
@@ -714,6 +920,8 @@ async fn run_client_loop(
         #[cfg(windows)]
         let event = if let Some(event) = immediate_event {
             event
+        } else if let Some(event) = drained_events.pop_front() {
+            event
         } else {
             tokio::select! {
                 _ = tokio::time::sleep_until(timer_deadline.into()) => ClientLoopEvent::Timer,
@@ -730,6 +938,8 @@ async fn run_client_loop(
         };
         #[cfg(unix)]
         let event = if let Some(event) = immediate_event {
+            event
+        } else if let Some(event) = drained_events.pop_front() {
             event
         } else {
             tokio::select! {
@@ -1360,62 +1570,35 @@ async fn run_client_loop(
                         if !endpoint_active {
                             continue;
                         }
-                        let composed = if let Some(shell) = &mut state.shell {
-                            shell.set_pane_surface(surface);
-                            shell.compose(state.reported_size.0, state.reported_size.1)
-                        } else {
-                            None
-                        };
-                        apply_client_shell_input_source_changes(
+                        coalesce_surface_presentation(
                             &mut state,
+                            &mut write_stream,
+                            &pending_activation,
+                            &mut event_rx,
+                            &mut drained_events,
                             &mut prefix_input_source,
+                            &endpoint_id,
+                            generation,
+                            now,
+                            SurfaceUpdate::Surface(surface),
                         );
-                        if let Some(frame) = composed {
-                            state.present_frame(frame);
-                        }
                     }
                     ServerMessage::PaneSurfacePatch(patch) => {
-                        let patch_started = crate::render_prof::timer();
-                        let apply_started = crate::render_prof::timer();
-                        let outcome = state
-                            .shell
-                            .as_mut()
-                            .map(|shell| shell.apply_pane_surface_patch(patch));
-                        crate::render_prof::duration_since(
-                            "client_surface_patch.apply",
-                            apply_started,
-                        );
-                        let compose_fallback = match outcome {
-                            Some(shell::ClientPaneSurfacePatchOutcome::Applied(Some(patch))) => {
-                                match state.present_surface_patch(patch) {
-                                    Ok(presented) => !presented,
-                                    Err(error) => {
-                                        warn!(%error, "failed to present retained pane surface patch");
-                                        state.request_repaint();
-                                        false
-                                    }
-                                }
-                            }
-                            Some(shell::ClientPaneSurfacePatchOutcome::Applied(None)) => true,
-                            Some(shell::ClientPaneSurfacePatchOutcome::Rejected) | None => false,
-                        };
-                        apply_client_shell_input_source_changes(
-                            &mut state,
-                            &mut prefix_input_source,
-                        );
-                        if compose_fallback {
-                            let composed = state.shell.as_mut().and_then(|shell| {
-                                shell.compose(state.reported_size.0, state.reported_size.1)
-                            });
-                            if let Some(frame) = composed {
-                                state.present_frame(frame);
-                            }
+                        if !endpoint_active {
+                            continue;
                         }
-                        crate::render_prof::duration_since(
-                            "client_surface_patch.total",
-                            patch_started,
+                        coalesce_surface_presentation(
+                            &mut state,
+                            &mut write_stream,
+                            &pending_activation,
+                            &mut event_rx,
+                            &mut drained_events,
+                            &mut prefix_input_source,
+                            &endpoint_id,
+                            generation,
+                            now,
+                            SurfaceUpdate::Patch(patch),
                         );
-                        crate::render_prof::flush_if_due();
                     }
                     ServerMessage::Terminal(frame) => {
                         if state.kitty_graphics_enabled
@@ -2138,6 +2321,144 @@ async fn run_client_loop(
     let _ = io::stdout().flush();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod surface_presentation_tests {
+    use super::*;
+
+    struct NoopTransport;
+
+    impl endpoint::EndpointTransport for NoopTransport {
+        fn send(&mut self, _message: &crate::protocol::ClientMessage) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn composed_patch() -> shell::ClientComposedSurfacePatch {
+        shell::ClientComposedSurfacePatch {
+            rows: Vec::new(),
+            cursor: None,
+        }
+    }
+
+    fn surface_patch(surface_revision: u64) -> crate::protocol::PaneSurfacePatch {
+        crate::protocol::PaneSurfacePatch {
+            boot_id: "boot-1".into(),
+            projection_revision: 1,
+            base_surface_revision: surface_revision,
+            surface_revision: surface_revision + 1,
+            rows: Vec::new(),
+            panes: Vec::new(),
+            cursor: None,
+        }
+    }
+
+    fn surface_message_event(patch: crate::protocol::PaneSurfacePatch) -> ClientLoopEvent {
+        ClientLoopEvent::ServerMessage {
+            endpoint_id: endpoint::ClientEndpointId::Local,
+            generation: 1,
+            message: Box::new(crate::protocol::ServerMessage::PaneSurfacePatch(patch)),
+        }
+    }
+
+    #[test]
+    fn repeated_surface_messages_coalesce_into_one_full_frame_presentation() {
+        let mut batch = SurfacePresentationBatch::default();
+        for _ in 0..8 {
+            batch.observe_surface();
+        }
+        assert!(matches!(batch.resolve(), SurfacePresentation::FullFrame));
+    }
+
+    #[test]
+    fn repeated_patch_messages_present_once() {
+        let mut batch = SurfacePresentationBatch::default();
+        batch.observe_patch(Some(composed_patch()));
+        assert!(matches!(batch.resolve(), SurfacePresentation::Patch(_)));
+
+        let mut batch = SurfacePresentationBatch::default();
+        for _ in 0..8 {
+            batch.observe_patch(Some(composed_patch()));
+        }
+        assert!(!matches!(batch.resolve(), SurfacePresentation::None));
+    }
+
+    #[test]
+    fn a_surface_message_supersedes_pending_patch_presentation() {
+        let mut batch = SurfacePresentationBatch::default();
+        batch.observe_patch(Some(composed_patch()));
+        batch.observe_surface();
+        assert!(matches!(batch.resolve(), SurfacePresentation::FullFrame));
+
+        let mut batch = SurfacePresentationBatch::default();
+        batch.observe_surface();
+        batch.observe_patch(Some(composed_patch()));
+        assert!(matches!(batch.resolve(), SurfacePresentation::FullFrame));
+    }
+
+    #[test]
+    fn patch_fallback_presents_full_frame_and_empty_batch_presents_nothing() {
+        let mut batch = SurfacePresentationBatch::default();
+        batch.observe_patch(None);
+        assert!(matches!(batch.resolve(), SurfacePresentation::FullFrame));
+
+        assert!(matches!(
+            SurfacePresentationBatch::default().resolve(),
+            SurfacePresentation::None
+        ));
+    }
+
+    #[test]
+    fn surface_drain_applies_queued_surfaces_and_preserves_other_messages() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(64);
+        for surface_revision in 1..6_u64 {
+            event_tx
+                .blocking_send(surface_message_event(surface_patch(surface_revision)))
+                .expect("surface event queued");
+        }
+        event_tx
+            .blocking_send(ClientLoopEvent::ServerMessage {
+                endpoint_id: endpoint::ClientEndpointId::Local,
+                generation: 1,
+                message: Box::new(crate::protocol::ServerMessage::Terminal(
+                    crate::protocol::TerminalFrame {
+                        seq: 0,
+                        width: 0,
+                        height: 0,
+                        full: false,
+                        bytes: Vec::new(),
+                    },
+                )),
+            })
+            .expect("terminal event queued");
+
+        let mut state = ClientState::test_new();
+        let mut write_stream =
+            endpoint::EndpointRegistry::new(NoopTransport, 1, Default::default());
+        let mut drained_events = VecDeque::new();
+        let mut prefix_input_source = crate::platform::RealPrefixInputSource::default();
+        coalesce_surface_presentation(
+            &mut state,
+            &mut write_stream,
+            &None,
+            &mut event_rx,
+            &mut drained_events,
+            &mut prefix_input_source,
+            &endpoint::ClientEndpointId::Local,
+            1,
+            std::time::Instant::now(),
+            SurfaceUpdate::Patch(surface_patch(0)),
+        );
+
+        assert!(event_rx.try_recv().is_err(), "all surface events drained");
+        assert_eq!(drained_events.len(), 1);
+        assert!(matches!(
+            drained_events.pop_front(),
+            Some(ClientLoopEvent::ServerMessage { message, .. })
+                if matches!(*message, crate::protocol::ServerMessage::Terminal(_))
+        ));
+    }
 }
 
 #[cfg(test)]
