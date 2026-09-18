@@ -612,17 +612,18 @@ pub(super) fn handle_endpoint_attention(
     endpoint_was_active
 }
 
+/// Installs an endpoint snapshot and returns the frame the caller should present. `defer_present`
+/// skips composing entirely so a coalesced presentation turn can present once at its end.
 pub(super) fn install_client_shell_snapshot(
     state: &mut ClientState,
     endpoint_id: &endpoint::ClientEndpointId,
     snapshot: Box<crate::protocol::ClientShellSnapshot>,
     projection_pending: bool,
+    defer_present: bool,
     endpoints: &mut endpoint::EndpointRegistry,
     prefix_input_source: &mut impl crate::platform::PrefixInputSource,
-) -> Result<(), ClientError> {
-    let Some(connection) = endpoints.connection(endpoint_id) else {
-        return Ok(());
-    };
+) -> Option<FrameData> {
+    let connection = endpoints.connection(endpoint_id)?;
     let generation = connection.generation;
     let project_snapshot =
         !projection_pending && endpoints.active_id() == endpoint_id && connection.surface_active;
@@ -646,8 +647,13 @@ pub(super) fn install_client_shell_snapshot(
         }
         let graphics_cleanup = shell.take_pending_graphics_cleanup();
         let next_size = shell.surface_size(state.reported_size.0, state.reported_size.1);
+        let composed = if defer_present {
+            None
+        } else {
+            shell.compose(state.reported_size.0, state.reported_size.1)
+        };
         (
-            shell.compose(state.reported_size.0, state.reported_size.1),
+            composed,
             (previous_size != next_size).then(|| {
                 client_shell_resize_message(
                     shell,
@@ -668,14 +674,11 @@ pub(super) fn install_client_shell_snapshot(
     if let Some(resize) = resize {
         endpoints.send_to(endpoint_id, &resize);
     }
-    if let Some(frame) = composed {
-        if projection_pending {
-            state.present_frame(frame);
-        } else {
-            state.present_frozen_chrome(frame);
-        }
+    if defer_present {
+        None
+    } else {
+        composed
     }
-    Ok(())
 }
 
 pub(super) fn finish_client_shell_input(
