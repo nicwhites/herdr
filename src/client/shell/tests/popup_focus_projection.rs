@@ -116,6 +116,7 @@ fn modal_paste_target_requires_a_focused_editable_client_field() {
         search_prompt: Some(ClientCopySearchPrompt {
             direction: crate::api::schema::PaneCopySearchDirection::Forward,
             query: TextEditor::default(),
+            count: 1,
         }),
         search_query: String::new(),
         search_direction: None,
@@ -124,7 +125,12 @@ fn modal_paste_target_requires_a_focused_editable_client_field() {
         search_current: None,
         search_current_global: None,
         search_generation: 0,
+        search_cache_generation: None,
         copy_after_search: false,
+        pending_count: None,
+        pending_find: None,
+        pending_text_object: None,
+        last_find: None,
     });
     state.mode = ClientShellMode::Copy;
     assert!(state.modal_paste_target_active());

@@ -228,6 +228,7 @@ fn foreign_workspace_preview_blocks_paste_into_hidden_copy_search() {
     state.copy_mode.as_mut().unwrap().search_prompt = Some(ClientCopySearchPrompt {
         direction: crate::api::schema::PaneCopySearchDirection::Forward,
         query: "original".into(),
+        count: 1,
     });
     preview_key(&mut state, b"\x1b[B");
     assert!(state.workspace_preview_action_blocked());

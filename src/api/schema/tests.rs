@@ -63,6 +63,47 @@ fn request_uses_dot_method_names() {
 }
 
 #[test]
+fn pane_copy_object_find_wire_shape_is_explicit_and_round_trips() {
+    let request = Request {
+        id: "find".into(),
+        method: Method::PaneCopyObject(PaneCopyObjectParams {
+            pane_id: "w1:p1".into(),
+            cursor: PaneTextPoint { row: 7, col: 3 },
+            request: PaneCopyObjectRequest::Find {
+                ch: 'x',
+                direction: PaneCopySearchDirection::Forward,
+                till: true,
+                count: 2,
+                repeat: true,
+            },
+            content_revision: Some(8),
+        }),
+    };
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "id": "find",
+            "method": "pane.copy_object",
+            "params": {
+                "pane_id": "w1:p1",
+                "cursor": { "row": 7, "col": 3 },
+                "request": {
+                    "kind": "find",
+                    "ch": "x",
+                    "direction": "forward",
+                    "till": true,
+                    "count": 2,
+                    "repeat": true
+                },
+                "content_revision": 8
+            }
+        })
+    );
+    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), request);
+}
+
+#[test]
 fn workspace_close_group_intent_defaults_false_and_round_trips() {
     let request: Request = serde_json::from_value(serde_json::json!({
         "id": "close",
@@ -215,6 +256,26 @@ fn request_round_trips_for_server_stop() {
 
     let json = serde_json::to_value(&request).unwrap();
     assert_eq!(json["method"], "server.stop");
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, request);
+}
+
+#[test]
+fn request_round_trips_for_pane_selection_read_block() {
+    let request = Request {
+        id: "req_block".into(),
+        method: Method::PaneSelectionReadBlock(PaneSelectionReadParams {
+            pane_id: "pane_1".into(),
+            anchor: PaneTextPoint { row: 1, col: 2 },
+            cursor: PaneTextPoint { row: 3, col: 4 },
+            content_revision: Some(7),
+        }),
+    };
+
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "pane.selection.read_block");
+    assert_eq!(json["params"]["anchor"]["row"], 1);
+    assert_eq!(json["params"]["content_revision"], 7);
     let restored: Request = serde_json::from_value(json).unwrap();
     assert_eq!(restored, request);
 }

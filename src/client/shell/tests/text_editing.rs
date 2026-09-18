@@ -92,7 +92,22 @@ fn all_ten_fields_route_shared_text_editing() {
         press(&mut state, KeyCode::Left, KeyModifiers::NONE);
         let result = press(&mut state, KeyCode::Char('X'), KeyModifiers::NONE);
         assert!(result.repaint, "field {field}");
-        assert!(result.requests.is_empty() && result.actions.is_empty());
+        assert!(result.requests.is_empty(), "field {field}");
+        if field == 9 {
+            assert!(
+                matches!(
+                    &result.actions[..],
+                    [ClientShellAction::Endpoint { request, .. }]
+                        if matches!(
+                            &request.method,
+                            crate::api::schema::Method::PaneCopySearch(params) if params.query == "aXb"
+                        )
+                ),
+                "field {field}"
+            );
+        } else {
+            assert!(result.actions.is_empty(), "field {field}");
+        }
         assert_eq!(editor(&mut state).as_str(), "aXb");
     }
 }
@@ -353,8 +368,20 @@ fn copy_search_owns_prefix_but_parked_prompt_does_not_steal_input() {
     *editor(&mut state) = TextEditor::from("ab");
     press(&mut state, KeyCode::Char('b'), KeyModifiers::CONTROL);
     assert_eq!(state.mode, ClientShellMode::Copy);
-    state.handle_raw_events(vec![RawInputEvent::Text(TextCommit::new("X"))]);
+    let typed = state.handle_raw_events(vec![RawInputEvent::Text(TextCommit::new("X"))]);
     assert_eq!(editor(&mut state).as_str(), "aXb");
+    // Settle the queued live search so the parked prompt carries no in-flight operation.
+    if let Some(ClientShellAction::Endpoint { request, .. }) = typed.actions.first() {
+        let request_id = request.id.clone();
+        state.handle_endpoint_result(
+            "boot-1",
+            &request_id,
+            Err(ClientShellEndpointError {
+                code: Some("stale_content".into()),
+                message: "stale".into(),
+            }),
+        );
+    }
     state.open_rename_pane_overlay();
     assert!(state.modal_paste_target_active());
     state.handle_raw_events(vec![RawInputEvent::Paste("name".into())]);

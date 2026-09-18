@@ -352,20 +352,27 @@ fn highlighted_search_match_copies_after_in_flight_repeat() {
         KeyCode::Char('/'),
         KeyModifiers::empty(),
     ))]);
-    state.handle_raw_events(vec![RawInputEvent::Text(crate::input::TextCommit::new(
+    let typed = state.handle_raw_events(vec![RawInputEvent::Text(crate::input::TextCommit::new(
         "needle",
     ))]);
+    let [ClientShellAction::Endpoint { request, .. }] = &typed.actions[..] else {
+        panic!("live search request");
+    };
+    let request_id = request.id.clone();
+    state.handle_endpoint_result(
+        "boot-1",
+        &request_id,
+        Ok(copy_search_result(matches.clone(), Some(0))),
+    );
     let initial = state.handle_raw_events(vec![RawInputEvent::Key(
         crate::input::TerminalKey::new(KeyCode::Enter, KeyModifiers::empty()),
     )]);
-    let [ClientShellAction::Endpoint { request, .. }] = &initial.actions[..] else {
-        panic!("initial search request");
-    };
-    state.handle_endpoint_result(
-        "boot-1",
-        &request.id,
-        Ok(copy_search_result(matches.clone(), Some(0))),
-    );
+    // The live result is the committed first search; Enter only reveals it.
+    assert!(!initial.actions.iter().any(|action| matches!(
+        action,
+        ClientShellAction::Endpoint { request, .. }
+            if matches!(&request.method, crate::api::schema::Method::PaneCopySearch(_))
+    )));
     let repeat = state.handle_raw_events(vec![RawInputEvent::Key(crate::input::TerminalKey::new(
         KeyCode::Char('n'),
         KeyModifiers::empty(),

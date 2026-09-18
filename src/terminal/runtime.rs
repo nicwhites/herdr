@@ -315,6 +315,49 @@ impl TerminalRuntime {
         self.0.paragraph_motion_target(row, direction)
     }
 
+    pub(crate) fn find_char_target(
+        &self,
+        row: u32,
+        col: u16,
+        ch: char,
+        forward: bool,
+        till: bool,
+        count: u32,
+        repeat: bool,
+    ) -> Option<crate::pane::TerminalTextPoint> {
+        self.0
+            .find_char_target(row, col, ch, forward, till, count, repeat)
+    }
+
+    pub(crate) fn enclosing_object_range(
+        &self,
+        row: u32,
+        col: u16,
+        open: char,
+        close: char,
+        inside: bool,
+        count: u32,
+    ) -> Option<(
+        crate::pane::TerminalTextPoint,
+        crate::pane::TerminalTextPoint,
+    )> {
+        self.0
+            .enclosing_object_range(row, col, open, close, inside, count)
+    }
+
+    pub(crate) fn word_object_range(
+        &self,
+        row: u32,
+        col: u16,
+        big: bool,
+        inside: bool,
+    ) -> Option<(
+        crate::pane::TerminalTextPoint,
+        crate::pane::TerminalTextPoint,
+    )> {
+        self.0.word_object_range(row, col, big, inside)
+    }
+
     pub fn bracketed_paste_enabled(&self) -> bool {
         self.0.bracketed_paste_enabled()
     }
@@ -405,6 +448,13 @@ impl TerminalRuntime {
 
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
         self.0.extract_selection(selection)
+    }
+
+    pub fn extract_block_selection(
+        &self,
+        selection: &crate::selection::Selection,
+    ) -> Option<String> {
+        self.0.extract_block_selection(selection)
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, show_cursor: bool) {
