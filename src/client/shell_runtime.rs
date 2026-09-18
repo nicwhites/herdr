@@ -238,7 +238,7 @@ pub(super) fn begin_endpoint_activation(
             if activation.can_retarget(&endpoint_id) {
                 let retarget_error = activation.retarget(target, endpoints).err();
                 if let Some(error) = retarget_error {
-                    rollback_endpoint_activation(state, endpoints, pending, error, false);
+                    rollback_endpoint_activation(state, endpoints, pending, error);
                 }
             } else {
                 // Once rollback starts, even a request for the original target is a new intent.
@@ -345,7 +345,6 @@ pub(super) fn begin_endpoint_activation(
                         .map(|shell| shell.endpoint_label(&endpoint_id).to_owned())
                         .unwrap_or_else(|| format!("{endpoint_id:?}"))
                 ),
-                false,
             );
         }
     }
@@ -393,8 +392,11 @@ pub(super) fn complete_endpoint_activation(
                 state.retire_endpoint_graphics(previous);
             }
         }
-        // The coherent target frame can replace the frozen source now, but the registry keeps
-        // pane input disabled until a second projection epoch has replayed host modes/effects.
+        // The coherent target frame replaces the frozen source, so presentation resumes at
+        // this commit. Pane input stays parked until the presentation-effects fence has
+        // replayed the target's host input modes in the final branch below; rollback
+        // synchronization stays frozen so endpoint commands keep failing fast until the
+        // source restoration fully completes.
         state.unfreeze_presentation();
         let (cleanup, frame) = {
             let shell = state.shell.as_mut().expect("checked client shell");
@@ -482,12 +484,11 @@ pub(super) fn rollback_endpoint_activation(
     endpoints: &mut endpoint::EndpointRegistry,
     pending: &mut Option<endpoint::PendingEndpointActivation>,
     error: String,
-    source_release_rejected: bool,
 ) {
     let Some(activation) = pending.as_mut() else {
         return;
     };
-    match activation.rollback(endpoints, error.clone(), source_release_rejected) {
+    match activation.rollback(endpoints, error.clone()) {
         endpoint::ActivationRollback::Pending => state.freeze_presentation(),
         endpoint::ActivationRollback::Unavailable(message) => {
             *pending = None;
@@ -611,17 +612,18 @@ pub(super) fn handle_endpoint_attention(
     endpoint_was_active
 }
 
+/// Installs an endpoint snapshot and returns the frame the caller should present. `defer_present`
+/// skips composing entirely so a coalesced presentation turn can present once at its end.
 pub(super) fn install_client_shell_snapshot(
     state: &mut ClientState,
     endpoint_id: &endpoint::ClientEndpointId,
     snapshot: Box<crate::protocol::ClientShellSnapshot>,
     projection_pending: bool,
+    defer_present: bool,
     endpoints: &mut endpoint::EndpointRegistry,
     prefix_input_source: &mut impl crate::platform::PrefixInputSource,
-) -> Result<(), ClientError> {
-    let Some(connection) = endpoints.connection(endpoint_id) else {
-        return Ok(());
-    };
+) -> Option<FrameData> {
+    let connection = endpoints.connection(endpoint_id)?;
     let generation = connection.generation;
     let project_snapshot =
         !projection_pending && endpoints.active_id() == endpoint_id && connection.surface_active;
@@ -645,8 +647,13 @@ pub(super) fn install_client_shell_snapshot(
         }
         let graphics_cleanup = shell.take_pending_graphics_cleanup();
         let next_size = shell.surface_size(state.reported_size.0, state.reported_size.1);
+        let composed = if defer_present {
+            None
+        } else {
+            shell.compose(state.reported_size.0, state.reported_size.1)
+        };
         (
-            shell.compose(state.reported_size.0, state.reported_size.1),
+            composed,
             (previous_size != next_size).then(|| {
                 client_shell_resize_message(
                     shell,
@@ -667,14 +674,11 @@ pub(super) fn install_client_shell_snapshot(
     if let Some(resize) = resize {
         endpoints.send_to(endpoint_id, &resize);
     }
-    if let Some(frame) = composed {
-        if projection_pending {
-            state.present_frame(frame);
-        } else {
-            state.present_frozen_chrome(frame);
-        }
+    if defer_present {
+        None
+    } else {
+        composed
     }
-    Ok(())
 }
 
 pub(super) fn finish_client_shell_input(
@@ -704,7 +708,7 @@ pub(super) fn finish_client_shell_input(
         );
         if let Some(activation) = pending_activation.as_mut() {
             if let Err(error) = activation.update_resize(resize, endpoints) {
-                rollback_endpoint_activation(state, endpoints, pending_activation, error, false);
+                rollback_endpoint_activation(state, endpoints, pending_activation, error);
             }
         } else {
             let _ = write_to_server(endpoints, &resize);
@@ -748,13 +752,7 @@ pub(super) fn finish_client_shell_input(
             state.record_host_theme_update(update);
             if let Some(activation) = pending_activation.as_mut() {
                 if let Err(error) = activation.update_host_theme(update.clone(), endpoints) {
-                    rollback_endpoint_activation(
-                        state,
-                        endpoints,
-                        pending_activation,
-                        error,
-                        false,
-                    );
+                    rollback_endpoint_activation(state, endpoints, pending_activation, error);
                 }
                 continue;
             }
@@ -764,13 +762,7 @@ pub(super) fn finish_client_shell_input(
         if let ClientMessage::ClientShellFocus { focused } = request {
             if let Some(activation) = pending_activation.as_mut() {
                 if let Err(error) = activation.update_host_focus(focused, endpoints) {
-                    rollback_endpoint_activation(
-                        state,
-                        endpoints,
-                        pending_activation,
-                        error,
-                        false,
-                    );
+                    rollback_endpoint_activation(state, endpoints, pending_activation, error);
                 }
                 continue;
             }
@@ -784,7 +776,8 @@ pub(super) fn finish_client_shell_input(
             continue;
         }
         if pending_activation.is_some() {
-            // Pane input and non-focus host effects do not cross the frozen handoff boundary.
+            // Host input modes are not replayed until the presentation-effects fence
+            // completes, so pane input encoded for stale modes must not cross the handoff.
             continue;
         }
         write_to_server(endpoints, &request).map_err(ClientError::ConnectionLost)?;

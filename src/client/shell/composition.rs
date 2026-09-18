@@ -131,6 +131,8 @@ impl ClientShellState {
     }
 
     pub(crate) fn compose(&mut self, cols: u16, rows: u16) -> Option<FrameData> {
+        #[cfg(test)]
+        super::super::TEST_PRESENTATION_COMPOSES.with(|count| count.set(count.get() + 1));
         self.last_composed_at = Some(std::time::Instant::now());
         self.selection_repaint_deadline = None;
         if self.last_composed_size != Some((cols, rows)) && self.mode == ClientShellMode::Navigate {

@@ -172,10 +172,15 @@ impl ClientShellState {
         if let Some(reason) = fast_path_blocker {
             crate::render_prof::event(reason);
         }
-        let fast_path_area = fast_path_blocker.is_none().then(|| {
-            let (cols, rows) = self.last_composed_size.unwrap_or_default();
-            self.layout(cols, rows).pane_surface
-        });
+        if fast_path_blocker.is_none() && self.last_composed_size.is_none() {
+            crate::render_prof::event("client_surface_patch.fallback.last_composed_size");
+        }
+        let fast_path_area = if fast_path_blocker.is_none() {
+            self.last_composed_size
+                .map(|(cols, rows)| self.layout(cols, rows).pane_surface)
+        } else {
+            None
+        };
         let composed_patch = fast_path_area.map(|area| ClientComposedSurfacePatch {
             rows: patch
                 .rows
