@@ -3113,6 +3113,7 @@ impl PaneRuntime {
         )>,
         limit: usize,
     ) -> crate::pane::TerminalSearchWindow {
+        let content_seq = self.content_seq.load(Ordering::Acquire);
         let result = self.terminal.search_text_window(
             query,
             case_sensitive,
@@ -3120,6 +3121,7 @@ impl PaneRuntime {
             cursor,
             previous,
             limit,
+            content_seq,
         );
         self.compression.wake();
         result

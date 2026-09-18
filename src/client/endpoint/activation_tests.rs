@@ -1,5 +1,12 @@
 use super::*;
 
+struct NullPrefixInputSource;
+
+impl crate::platform::PrefixInputSource for NullPrefixInputSource {
+    fn switch_to_ascii(&mut self) {}
+    fn restore(&mut self) {}
+}
+
 fn endpoint() -> ClientEndpointId {
     ClientEndpointId::Ssh(
         super::super::ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),
@@ -228,6 +235,307 @@ fn surface(boot_id: &str, revision: u64, pane: &str) -> crate::protocol::PaneSur
     }
 }
 
+#[test]
+fn presentation_sync_commit_keeps_pane_input_gated_until_effects_fence() {
+    let mut state = crate::client::ClientState::test_new();
+    let target = endpoint();
+    {
+        let shell = state.shell.as_mut().expect("test client shell");
+        shell.set_endpoint_catalog(&[super::super::SavedSshEndpoint {
+            id: super::super::ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+            label: "Remote".into(),
+            target: "dev@example.com".into(),
+            session: "main".into(),
+            enabled: true,
+        }]);
+        shell.set_snapshot(Box::new(test_snapshot("local-boot", 1)));
+        shell.set_endpoint_status(&target, ClientEndpointStatus::Online);
+        shell.set_endpoint_snapshot(&target, Box::new(test_snapshot("remote-boot", 1)));
+    }
+    let mut endpoints = EndpointRegistry::new(
+        FakeTransport {
+            sent: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_after_write: false,
+        },
+        1,
+        negotiation(),
+    );
+    endpoints.insert(
+        target.clone(),
+        FakeTransport {
+            sent: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_after_write: false,
+        },
+        7,
+        negotiation(),
+        false,
+    );
+    let mut pending = Some(machine());
+    if let Some(activation) = pending.as_mut() {
+        if let ActivationPhase::ActivatingTarget { evidence, .. } = &mut activation.phase {
+            evidence.surface = Some(surface("remote-boot", 1, "pane"));
+        }
+    }
+    let mut commands = crate::client::endpoint_commands::EndpointCommands::default();
+    state.freeze_presentation();
+    endpoints.freeze_input();
+
+    crate::client::shell_runtime::complete_endpoint_activation(
+        &mut state,
+        &mut endpoints,
+        &mut pending,
+        &mut commands,
+    )
+    .unwrap();
+    assert!(
+        !endpoints.active_surface_available(),
+        "pane input stays parked until the presentation-effects fence replays host modes"
+    );
+    assert!(
+        !state.presentation_frozen,
+        "presentation unfreezes at the coherent presentation commit"
+    );
+    assert!(
+        pending.is_some(),
+        "presentation effects sync is still pending after the commit"
+    );
+
+    if let Some(activation) = pending.as_mut() {
+        activation.phase = ActivationPhase::AwaitingPresentationEffects {
+            lease: lease(target, 7, "remote-boot"),
+            token: "epoch:7:remote-boot".into(),
+            ready: true,
+            completion: Box::new(ActivationCompletion::Activated),
+        };
+    }
+    crate::client::shell_runtime::complete_endpoint_activation(
+        &mut state,
+        &mut endpoints,
+        &mut pending,
+        &mut commands,
+    )
+    .unwrap();
+    assert!(pending.is_none(), "fence completion retires the activation");
+    assert!(
+        endpoints.active_surface_available(),
+        "fence completion resumes pane input after host modes are replayed"
+    );
+}
+
+#[test]
+fn pane_input_does_not_cross_the_handoff_before_the_effects_fence_completes() {
+    let mut state = crate::client::ClientState::test_new();
+    let target = endpoint();
+    {
+        let shell = state.shell.as_mut().expect("test client shell");
+        shell.set_endpoint_catalog(&[super::super::SavedSshEndpoint {
+            id: super::super::ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+            label: "Remote".into(),
+            target: "dev@example.com".into(),
+            session: "main".into(),
+            enabled: true,
+        }]);
+        shell.set_snapshot(Box::new(test_snapshot("local-boot", 1)));
+        shell.set_endpoint_status(&target, ClientEndpointStatus::Online);
+        shell.set_endpoint_snapshot(&target, Box::new(test_snapshot("remote-boot", 1)));
+    }
+    let target_sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut endpoints = EndpointRegistry::new(
+        FakeTransport {
+            sent: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_after_write: false,
+        },
+        1,
+        negotiation(),
+    );
+    endpoints.insert(
+        target.clone(),
+        FakeTransport {
+            sent: target_sent.clone(),
+            fail_after_write: false,
+        },
+        7,
+        negotiation(),
+        false,
+    );
+    let mut pending = Some(machine());
+    if let Some(activation) = pending.as_mut() {
+        if let ActivationPhase::ActivatingTarget { evidence, .. } = &mut activation.phase {
+            evidence.surface = Some(surface("remote-boot", 1, "pane"));
+        }
+    }
+    let mut commands = crate::client::endpoint_commands::EndpointCommands::default();
+    endpoints.freeze_input();
+
+    crate::client::shell_runtime::complete_endpoint_activation(
+        &mut state,
+        &mut endpoints,
+        &mut pending,
+        &mut commands,
+    )
+    .unwrap();
+    assert!(pending.is_some(), "the effects fence is still pending");
+
+    let mut scheduled = None;
+    let pane_input = crate::client::shell::ClientShellInput {
+        requests: vec![crate::protocol::ClientMessage::ClientShellPaneInput {
+            pane_id: "pane".into(),
+            events: vec![crate::protocol::ClientPaneInputEvent::TextCommit(
+                "x".into(),
+            )],
+        }],
+        ..Default::default()
+    };
+    crate::client::shell_runtime::finish_client_shell_input(
+        &mut state,
+        pane_input,
+        None,
+        &mut endpoints,
+        &mut pending,
+        &mut commands,
+        &mut NullPrefixInputSource,
+        &mut scheduled,
+    )
+    .unwrap();
+    assert!(pending.is_some(), "the effects fence must still be pending");
+    let sent = target_sent.lock().unwrap();
+    assert!(
+        sent.iter().all(|message| !matches!(
+            message,
+            crate::protocol::ClientMessage::ClientShellPaneInput { .. }
+        )),
+        "pane input must not be delivered before the effects fence completes"
+    );
+    drop(sent);
+
+    if let Some(activation) = pending.as_mut() {
+        activation.phase = ActivationPhase::AwaitingPresentationEffects {
+            lease: lease(target, 7, "remote-boot"),
+            token: "epoch:7:remote-boot".into(),
+            ready: true,
+            completion: Box::new(ActivationCompletion::Activated),
+        };
+    }
+    crate::client::shell_runtime::complete_endpoint_activation(
+        &mut state,
+        &mut endpoints,
+        &mut pending,
+        &mut commands,
+    )
+    .unwrap();
+    assert!(pending.is_none());
+    let pane_input = crate::client::shell::ClientShellInput {
+        requests: vec![crate::protocol::ClientMessage::ClientShellPaneInput {
+            pane_id: "pane".into(),
+            events: vec![crate::protocol::ClientPaneInputEvent::TextCommit(
+                "y".into(),
+            )],
+        }],
+        ..Default::default()
+    };
+    crate::client::shell_runtime::finish_client_shell_input(
+        &mut state,
+        pane_input,
+        None,
+        &mut endpoints,
+        &mut pending,
+        &mut commands,
+        &mut NullPrefixInputSource,
+        &mut scheduled,
+    )
+    .unwrap();
+    let sent = target_sent.lock().unwrap();
+    assert!(
+        sent.iter().any(|message| matches!(
+            message,
+            crate::protocol::ClientMessage::ClientShellPaneInput { .. }
+        )),
+        "pane input flows to the target once the effects fence has completed"
+    );
+}
+
+#[test]
+fn rollback_presentation_sync_keeps_input_frozen_until_source_restore_completes() {
+    let mut state = crate::client::ClientState::test_new();
+    let local = ClientEndpointId::Local;
+    if let Some(shell) = state.shell.as_mut() {
+        shell.set_endpoint_status(&local, ClientEndpointStatus::Online);
+        shell.set_snapshot(Box::new(test_snapshot("local-boot", 1)));
+    }
+    let mut endpoints = EndpointRegistry::new(
+        FakeTransport {
+            sent: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_after_write: false,
+        },
+        1,
+        negotiation(),
+    );
+    endpoints.insert(
+        endpoint(),
+        FakeTransport {
+            sent: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_after_write: false,
+        },
+        7,
+        negotiation(),
+        false,
+    );
+    // Model the rollback's frozen handoff: begin() froze the registry before the target failed.
+    endpoints.freeze_input();
+    let mut activation = machine();
+    activation.rollback_error = Some("endpoint handoff was rolled back".into());
+    activation.phase = ActivationPhase::RestoringSource {
+        request_id: "client-shell-surface:3:rollback-source-on".into(),
+        acknowledged_revision: Some(1),
+        evidence: ActivationEvidence::default(),
+    };
+    if let ActivationPhase::RestoringSource { evidence, .. } = &mut activation.phase {
+        evidence.surface = Some(surface("local-boot", 1, "pane"));
+    }
+    let mut pending = Some(activation);
+    let mut commands = crate::client::endpoint_commands::EndpointCommands::default();
+
+    crate::client::shell_runtime::complete_endpoint_activation(
+        &mut state,
+        &mut endpoints,
+        &mut pending,
+        &mut commands,
+    )
+    .unwrap();
+    assert!(
+        !endpoints.active_surface_available(),
+        "rollback synchronization restores the source but must keep pane input parked"
+    );
+    assert!(
+        pending.is_some(),
+        "the rollback effects fence is still pending after the source restoration commit"
+    );
+
+    if let Some(activation) = pending.as_mut() {
+        activation.phase = ActivationPhase::AwaitingPresentationEffects {
+            lease: lease(local.clone(), 1, "local-boot"),
+            token: "3:1:local-boot".into(),
+            ready: true,
+            completion: Box::new(ActivationCompletion::RestoredSource {
+                error: "endpoint handoff was rolled back".into(),
+                successor: None,
+            }),
+        };
+    }
+    crate::client::shell_runtime::complete_endpoint_activation(
+        &mut state,
+        &mut endpoints,
+        &mut pending,
+        &mut commands,
+    )
+    .unwrap();
+    assert!(pending.is_none(), "fence completion retires the rollback");
+    assert!(
+        endpoints.active_surface_available(),
+        "the final RestoredSource branch unfreezes pane input once the source is restored"
+    );
+}
+
 fn machine() -> PendingEndpointActivation {
     PendingEndpointActivation {
         source: lease(ClientEndpointId::Local, 1, "local-boot"),
@@ -261,27 +569,40 @@ fn source_off_request_is_distinct_and_precedes_target_on_phase() {
         focus: None,
         host_focused: true,
         resize: resize(),
-        phase: ActivationPhase::ReleasingSource {
-            request_id: "client-shell-surface:9:off".into(),
-        },
+        phase: ActivationPhase::ReleasingSource,
         deadline: Instant::now() + ACTIVATION_TIMEOUT,
         epoch: 9,
         next_focus_serial: 0,
         rollback_error: None,
         successor: None,
     };
-    assert!(activation.accepts_response(
-        &ClientEndpointId::Local,
-        1,
-        "local-boot",
-        "client-shell-surface:9:off"
-    ));
+    assert!(
+        !activation.accepts_response(
+            &ClientEndpointId::Local,
+            1,
+            "local-boot",
+            "client-shell-surface:9:off"
+        ),
+        "the source release result is fire-and-forget; this window consumes no responses"
+    );
     assert!(!activation.accepts_response(
         &endpoint(),
         7,
         "remote-boot",
         "client-shell-surface:9:on"
     ));
+
+    let pipelined = machine();
+    assert!(pipelined.accepts_response(&endpoint(), 7, "remote-boot", "client-shell-surface:3:on"));
+    assert!(
+        !pipelined.accepts_response(
+            &ClientEndpointId::Local,
+            1,
+            "local-boot",
+            "client-shell-surface:3:off"
+        ),
+        "the target activation must not wait for or consume the pipelined local off ack"
+    );
 }
 
 #[test]
@@ -342,13 +663,13 @@ fn observed_begin_write_failure_returns_recoverable_partial_activation() {
     );
     assert!(remote_sent.lock().unwrap().is_empty());
     assert!(matches!(
-        activation.rollback(&mut endpoints, error, false),
+        activation.rollback(&mut endpoints, error),
         ActivationRollback::Unavailable(_)
     ));
 }
 
 #[test]
-fn source_release_is_sent_and_acknowledged_before_target_activation() {
+fn target_surface_on_is_sent_before_local_source_off_ack() {
     let (shell, mut endpoints, local_sent, remote_sent) = shell_and_registry();
     let target = endpoint();
     let mut activation = PendingEndpointActivation::begin(
@@ -361,23 +682,36 @@ fn source_release_is_sent_and_acknowledged_before_target_activation() {
         Instant::now(),
     )
     .unwrap();
-    let local = local_sent.lock().unwrap();
+    {
+        let local = local_sent.lock().unwrap();
+        assert_eq!(
+            local.first(),
+            Some(&crate::protocol::ClientMessage::ClientShellFocus { focused: false }),
+            "source focus is revoked before source-off"
+        );
+        assert_eq!(
+            local
+                .as_slice()
+                .iter()
+                .filter_map(surface_set_active)
+                .collect::<Vec<_>>(),
+            vec![false],
+            "the source release is written before the target activation"
+        );
+    }
+    assert!(matches!(
+        activation.phase,
+        ActivationPhase::ActivatingTarget { .. }
+    ));
     assert_eq!(
-        local.first(),
-        Some(&crate::protocol::ClientMessage::ClientShellFocus { focused: false }),
-        "source focus is revoked before source-off"
+        remote_sent
+            .lock()
+            .unwrap()
+            .get(1)
+            .and_then(surface_set_active),
+        Some(true),
+        "the target surface-on is pipelined without waiting for the local source-off ack"
     );
-    assert_eq!(
-        local
-            .as_slice()
-            .iter()
-            .filter_map(surface_set_active)
-            .collect::<Vec<_>>(),
-        vec![false],
-        "the source is released first"
-    );
-    drop(local);
-    assert!(remote_sent.lock().unwrap().is_empty());
     assert!(
         !endpoints.active_surface_available(),
         "pane input is blocked while frozen"
@@ -391,18 +725,20 @@ fn source_release_is_sent_and_acknowledged_before_target_activation() {
             &surface_success("client-shell-surface:11:off", false, 1),
             &mut endpoints,
         ),
-        SurfaceActivationProgress::Pending
+        SurfaceActivationProgress::Stale,
+        "the local off acknowledgement is fire-and-forget"
     );
-    let remote = remote_sent.lock().unwrap();
-    assert!(matches!(
-        remote[0],
-        crate::protocol::ClientMessage::ClientShellResize { .. }
-    ));
     assert_eq!(
-        remote.get(2),
-        Some(&crate::protocol::ClientMessage::ClientShellFocus { focused: true })
+        activation.receive_response(
+            &target,
+            7,
+            "client-shell-surface:11:on",
+            &surface_success("client-shell-surface:11:on", true, 4),
+            &mut endpoints,
+        ),
+        SurfaceActivationProgress::Pending,
+        "the target activation proceeds on its own evidence without the local ack"
     );
-    assert_eq!(remote.get(1).and_then(surface_set_active), Some(true));
 }
 
 #[test]
@@ -619,8 +955,12 @@ fn latest_host_focus_is_replayed_to_the_eventual_target() {
         Instant::now(),
     )
     .unwrap();
+    // The target surface-on is pipelined, so host focus updates flow straight to the target.
     activation.update_host_focus(false, &mut endpoints).unwrap();
-    assert!(remote_sent.lock().unwrap().is_empty());
+    assert_eq!(
+        remote_sent.lock().unwrap().get(3),
+        Some(&crate::protocol::ClientMessage::ClientShellFocus { focused: false })
+    );
 
     let _ = activation.receive_response(
         &ClientEndpointId::Local,
@@ -630,8 +970,9 @@ fn latest_host_focus_is_replayed_to_the_eventual_target() {
         &mut endpoints,
     );
     assert_eq!(
-        remote_sent.lock().unwrap().get(2),
-        Some(&crate::protocol::ClientMessage::ClientShellFocus { focused: false })
+        remote_sent.lock().unwrap().len(),
+        4,
+        "the pipelined off acknowledgement is ignored"
     );
 
     activation.update_host_focus(true, &mut endpoints).unwrap();
@@ -674,12 +1015,13 @@ fn host_focus_change_restarts_an_issued_presentation_effects_fence() {
 }
 
 #[test]
-fn source_release_rejection_restores_the_source_coherently() {
-    let (shell, mut endpoints, local_sent, _remote_sent) = shell_and_registry();
+fn source_release_rejection_is_stale_and_does_not_disturb_the_pipelined_target() {
+    let (shell, mut endpoints, _local_sent, remote_sent) = shell_and_registry();
+    let target = endpoint();
     let mut activation = PendingEndpointActivation::begin(
         &shell,
         &mut endpoints,
-        endpoint(),
+        target.clone(),
         None,
         resize(),
         13,
@@ -694,35 +1036,46 @@ fn source_release_rejection_restores_the_source_coherently() {
             &failure("client-shell-surface:13:off", "source rejected release"),
             &mut endpoints,
         ),
-        SurfaceActivationProgress::Rejected {
-            message: "source rejected release".into(),
-            source_release_rejected: true,
-        }
+        SurfaceActivationProgress::Stale,
+        "a rejected pipelined release must not abort the in-flight target activation"
     );
-    assert_eq!(
-        activation.rollback(&mut endpoints, "source rejected release".into(), true),
-        ActivationRollback::Pending
-    );
+    assert!(matches!(
+        activation.phase,
+        ActivationPhase::ActivatingTarget { .. }
+    ));
     assert_eq!(endpoints.active_id(), &ClientEndpointId::Local);
     assert!(!endpoints.active_surface_available());
     assert_eq!(
-        local_sent
+        activation.receive_response(
+            &target,
+            7,
+            "client-shell-surface:13:on",
+            &surface_success("client-shell-surface:13:on", true, 1),
+            &mut endpoints,
+        ),
+        SurfaceActivationProgress::Pending,
+        "the target activation continues on its own evidence"
+    );
+    assert_eq!(
+        remote_sent
             .lock()
             .unwrap()
             .iter()
             .filter_map(surface_set_active)
             .collect::<Vec<_>>(),
-        vec![false, true]
+        vec![true],
+        "the unreleased source self-heals on the next transaction that touches it"
     );
 }
 
 #[test]
-fn source_release_timeout_starts_an_acknowledged_source_restore() {
-    let (shell, mut endpoints, local_sent, _remote_sent) = shell_and_registry();
+fn pipelined_handoff_rollback_releases_target_before_restoring_source() {
+    let (shell, mut endpoints, local_sent, remote_sent) = shell_and_registry();
+    let target = endpoint();
     let mut activation = PendingEndpointActivation::begin(
         &shell,
         &mut endpoints,
-        endpoint(),
+        target.clone(),
         None,
         resize(),
         14,
@@ -730,8 +1083,25 @@ fn source_release_timeout_starts_an_acknowledged_source_restore() {
     )
     .unwrap();
     assert_eq!(
-        activation.rollback(&mut endpoints, "source release timed out".into(), false),
+        activation.rollback(&mut endpoints, "target activation timed out".into()),
         ActivationRollback::Pending
+    );
+    assert_eq!(
+        remote_sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(surface_set_active)
+            .collect::<Vec<_>>(),
+        vec![true, false],
+        "the pipelined target may have accepted surface-on, so it is released first"
+    );
+    let _ = activation.receive_response(
+        &target,
+        7,
+        "client-shell-surface:14:rollback-target-off",
+        &surface_success("client-shell-surface:14:rollback-target-off", false, 1),
+        &mut endpoints,
     );
     let sent = local_sent.lock().unwrap();
     assert_eq!(
@@ -746,6 +1116,142 @@ fn source_release_timeout_starts_an_acknowledged_source_restore() {
         "local-boot",
         "client-shell-surface:14:rollback-source-on"
     ));
+}
+
+#[test]
+fn rollback_after_pipelined_off_still_restores_source() {
+    let (mut shell, mut endpoints, local_sent, _remote_sent) = shell_and_registry();
+    let target = endpoint();
+    let mut activation = PendingEndpointActivation::begin(
+        &shell,
+        &mut endpoints,
+        target.clone(),
+        None,
+        resize(),
+        27,
+        Instant::now(),
+    )
+    .unwrap();
+    // The pipelined source-off is acknowledged while the target activation is in flight.
+    assert_eq!(
+        activation.receive_response(
+            &ClientEndpointId::Local,
+            1,
+            "client-shell-surface:27:off",
+            &surface_success("client-shell-surface:27:off", false, 1),
+            &mut endpoints,
+        ),
+        SurfaceActivationProgress::Stale
+    );
+    assert_eq!(
+        activation.receive_response(
+            &target,
+            7,
+            "client-shell-surface:27:on",
+            &surface_success("client-shell-surface:27:on", true, 2),
+            &mut endpoints,
+        ),
+        SurfaceActivationProgress::Pending
+    );
+
+    // The target fails mid-flight after the source-off was already acked.
+    endpoints.fail(&target, std::io::ErrorKind::ConnectionReset.into());
+    for failure in endpoints.take_failures() {
+        assert_eq!(
+            activation.endpoint_disconnected(&mut endpoints, &failure.endpoint_id, failure.message),
+            ActivationRollback::Pending
+        );
+    }
+    assert!(matches!(
+        activation.phase,
+        ActivationPhase::RestoringSource { .. }
+    ));
+    assert_eq!(
+        local_sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(surface_set_active)
+            .collect::<Vec<_>>(),
+        vec![false, true],
+        "an already-acked pipelined off does not prevent an idempotent source restore"
+    );
+
+    let _ = activation.receive_response(
+        &ClientEndpointId::Local,
+        1,
+        "client-shell-surface:27:rollback-source-on",
+        &surface_success("client-shell-surface:27:rollback-source-on", true, 2),
+        &mut endpoints,
+    );
+    let snapshot = test_snapshot("local-boot", 2);
+    shell.set_endpoint_snapshot_for_generation(
+        &ClientEndpointId::Local,
+        1,
+        Box::new(snapshot.clone()),
+    );
+    assert_eq!(
+        activation.receive_snapshot(&ClientEndpointId::Local, 1, &snapshot),
+        SurfaceActivationProgress::Pending
+    );
+    assert_eq!(
+        activation.receive_surface(
+            &ClientEndpointId::Local,
+            1,
+            surface("local-boot", 2, "pane")
+        ),
+        SurfaceActivationProgress::Ready
+    );
+    assert!(matches!(
+        activation.complete(&mut shell, &mut endpoints),
+        Ok(ActivationCompletion::AwaitingPresentationSync {
+            previous: ClientEndpointId::Local,
+            endpoint: ClientEndpointId::Local,
+        })
+    ));
+    assert!(
+        !endpoints.active_surface_available(),
+        "rollback keeps pane input parked through the restoration commit"
+    );
+    let _ = activation.receive_response(
+        &ClientEndpointId::Local,
+        1,
+        "client-shell-surface:27:presentation-sync",
+        &surface_success("client-shell-surface:27:presentation-sync", true, 3),
+        &mut endpoints,
+    );
+    let sync_snapshot = test_snapshot("local-boot", 3);
+    shell.set_endpoint_snapshot_for_generation(
+        &ClientEndpointId::Local,
+        1,
+        Box::new(sync_snapshot.clone()),
+    );
+    let _ = activation.receive_snapshot(&ClientEndpointId::Local, 1, &sync_snapshot);
+    assert_eq!(
+        activation.receive_surface(
+            &ClientEndpointId::Local,
+            1,
+            surface("local-boot", 3, "pane")
+        ),
+        SurfaceActivationProgress::Ready
+    );
+    assert_eq!(
+        activation.complete(&mut shell, &mut endpoints),
+        Ok(ActivationCompletion::AwaitingPresentationEffects)
+    );
+    assert_eq!(
+        activation.receive_presentation_effects_ready(
+            &ClientEndpointId::Local,
+            1,
+            "27:1:local-boot"
+        ),
+        SurfaceActivationProgress::Ready
+    );
+    assert!(matches!(
+        activation.complete(&mut shell, &mut endpoints),
+        Ok(ActivationCompletion::RestoredSource { .. })
+    ));
+    assert_eq!(endpoints.active_id(), &ClientEndpointId::Local);
 }
 
 #[test]
@@ -1115,7 +1621,7 @@ fn local_escape(source_state: &str) {
     assert_ne!(endpoints.active_id(), &disconnected);
     assert!(
         !endpoints.active_surface_available(),
-        "runtime opens input only after the effects fence"
+        "the raw activation machine never unfreezes input; the runtime opens pane input at the coherent commit"
     );
 }
 
@@ -1147,7 +1653,7 @@ fn local_selection_abandons_every_unfinished_remote_handoff_phase() {
         }
         if matches!(phase, "rollback" | "restore") {
             assert_eq!(
-                abandoned.rollback(&mut endpoints, "cancel".into(), false),
+                abandoned.rollback(&mut endpoints, "cancel".into()),
                 ActivationRollback::Pending
             );
         }
@@ -1273,7 +1779,10 @@ fn local_selection_waits_for_fresh_metadata_without_abandoning_remote() {
             pending.as_ref().map(PendingEndpointActivation::target),
             Some(&endpoint())
         );
-        assert!(remote_sent.lock().unwrap().is_empty());
+        assert!(
+            !remote_sent.lock().unwrap().is_empty(),
+            "the target surface-on is pipelined without waiting for the source ack"
+        );
         assert_eq!(serial, 41);
         assert!(state.deferred_local_activation.is_some());
         assert!(take_ready_local_activation(&mut state, &endpoints).is_none());
@@ -1445,11 +1954,11 @@ fn unacknowledged_target_release_closes_target_before_restoring_source() {
         &mut endpoints,
     );
     assert_eq!(
-        activation.rollback(&mut endpoints, "target activation timed out".into(), false),
+        activation.rollback(&mut endpoints, "target activation timed out".into()),
         ActivationRollback::Pending
     );
     assert_eq!(
-        activation.rollback(&mut endpoints, "target release timed out".into(), false),
+        activation.rollback(&mut endpoints, "target release timed out".into()),
         ActivationRollback::Pending
     );
     assert!(endpoints.connection(&target).is_none());
@@ -1537,16 +2046,13 @@ fn losing_local_during_handoff_does_not_revoke_the_healthy_target() {
         )
         .unwrap();
         if source_released {
-            activation.receive_response(
+            let _ = activation.receive_response(
                 &ClientEndpointId::Local,
                 1,
                 "client-shell-surface:29:off",
                 &surface_success("client-shell-surface:29:off", false, 1),
                 &mut endpoints,
             );
-        }
-        if !source_released {
-            activation.deadline = Instant::now() - Duration::from_millis(1);
         }
         endpoints.fail(
             &ClientEndpointId::Local,

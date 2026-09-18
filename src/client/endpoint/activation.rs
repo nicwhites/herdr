@@ -110,9 +110,7 @@ impl PendingEndpointActivation {
             focus,
             host_focused: shell.host_focus_baseline(),
             resize,
-            phase: ActivationPhase::ReleasingSource {
-                request_id: format!("client-shell-surface:{serial}:off"),
-            },
+            phase: ActivationPhase::ReleasingSource,
             deadline: now + ACTIVATION_TIMEOUT,
             epoch: serial,
             next_focus_serial: 0,
@@ -166,7 +164,11 @@ impl PendingEndpointActivation {
             return Err("source endpoint release could not be sent".into());
         }
         endpoints.set_surface_active(&self.source.endpoint_id, false);
-        Ok(())
+        // The target surface-on is pipelined without waiting for the local source-off
+        // acknowledgement. The source-off result is fire-and-forget: its response is stale in
+        // every phase that follows, and a release that never lands remotely is retried by the
+        // next transaction that touches the source (release_surface_best_effort).
+        self.start_target(endpoints, self.resize.clone())
     }
 
     #[cfg(test)]
@@ -224,7 +226,7 @@ impl PendingEndpointActivation {
             && self.successor.is_none()
             && matches!(
                 self.phase,
-                ActivationPhase::ReleasingSource { .. } | ActivationPhase::ActivatingTarget { .. }
+                ActivationPhase::ReleasingSource | ActivationPhase::ActivatingTarget { .. }
             )
     }
 
@@ -258,7 +260,6 @@ impl PendingEndpointActivation {
         self.rollback(
             endpoints,
             "endpoint handoff superseded by a newer selection".into(),
-            false,
         )
     }
 
@@ -281,12 +282,6 @@ impl PendingEndpointActivation {
         request_id: &str,
     ) -> bool {
         match &self.phase {
-            ActivationPhase::ReleasingSource {
-                request_id: expected,
-            } => {
-                endpoint_matches(&self.source, endpoint_id, generation, boot_id)
-                    && expected == request_id
-            }
             ActivationPhase::ActivatingTarget {
                 request_id: expected,
                 focus_request_id,
@@ -316,6 +311,8 @@ impl PendingEndpointActivation {
                 endpoint_matches(lease, endpoint_id, generation, boot_id) && expected == request_id
             }
             ActivationPhase::AwaitingPresentationEffects { .. } => false,
+            // The release result is fire-and-forget; this phase never consumes responses.
+            ActivationPhase::ReleasingSource => false,
         }
     }
 
@@ -363,30 +360,11 @@ impl PendingEndpointActivation {
             Ok(result) => result,
             Err(error) => {
                 return SurfaceActivationProgress::Rejected {
-                    source_release_rejected: matches!(
-                        self.phase,
-                        ActivationPhase::ReleasingSource { .. }
-                    ) && error.code.is_some(),
                     message: error.message,
                 };
             }
         };
         match &mut self.phase {
-            ActivationPhase::ReleasingSource { .. } => {
-                if let Err(message) = surface_set_revision(&result, false) {
-                    return SurfaceActivationProgress::Rejected {
-                        message,
-                        source_release_rejected: false,
-                    };
-                }
-                if let Err(message) = self.start_target(endpoints, self.resize.clone()) {
-                    return SurfaceActivationProgress::Rejected {
-                        message,
-                        source_release_rejected: false,
-                    };
-                }
-                SurfaceActivationProgress::Pending
-            }
             ActivationPhase::ActivatingTarget {
                 request_id: surface_request_id,
                 acknowledged_revision,
@@ -395,10 +373,7 @@ impl PendingEndpointActivation {
                 let revision = match surface_set_revision(&result, true) {
                     Ok(revision) => revision,
                     Err(message) => {
-                        return SurfaceActivationProgress::Rejected {
-                            message,
-                            source_release_rejected: false,
-                        };
+                        return SurfaceActivationProgress::Rejected { message };
                     }
                 };
                 *acknowledged_revision = Some(revision);
@@ -417,7 +392,6 @@ impl PendingEndpointActivation {
                 if !focus_result_matches(Some(&requested), &result) {
                     return SurfaceActivationProgress::Rejected {
                         message: "endpoint focus returned an unexpected result".into(),
-                        source_release_rejected: false,
                     };
                 }
                 *focus_request_id = None;
@@ -425,10 +399,7 @@ impl PendingEndpointActivation {
                 if self.focus != Some(requested) {
                     *focus_acknowledged = false;
                     if let Err(message) = self.send_latest_focus(endpoints) {
-                        return SurfaceActivationProgress::Rejected {
-                            message,
-                            source_release_rejected: false,
-                        };
+                        return SurfaceActivationProgress::Rejected { message };
                     }
                     return self.progress();
                 }
@@ -437,10 +408,7 @@ impl PendingEndpointActivation {
             }
             ActivationPhase::ReleasingTargetForRollback { .. } => {
                 if let Err(message) = surface_set_revision(&result, false) {
-                    return SurfaceActivationProgress::Rejected {
-                        message,
-                        source_release_rejected: false,
-                    };
+                    return SurfaceActivationProgress::Rejected { message };
                 }
                 endpoints.set_surface_active(&self.target.endpoint_id, false);
                 if !self.source_available {
@@ -448,14 +416,10 @@ impl PendingEndpointActivation {
                         message: self.rollback_error.clone().unwrap_or_else(|| {
                             "the previous endpoint is no longer connected".into()
                         }),
-                        source_release_rejected: false,
                     };
                 }
                 if let Err(message) = self.start_source_restore(endpoints, self.resize.clone()) {
-                    return SurfaceActivationProgress::Rejected {
-                        message,
-                        source_release_rejected: false,
-                    };
+                    return SurfaceActivationProgress::Rejected { message };
                 }
                 SurfaceActivationProgress::Pending
             }
@@ -466,10 +430,7 @@ impl PendingEndpointActivation {
                 let revision = match surface_set_revision(&result, true) {
                     Ok(revision) => revision,
                     Err(message) => {
-                        return SurfaceActivationProgress::Rejected {
-                            message,
-                            source_release_rejected: false,
-                        };
+                        return SurfaceActivationProgress::Rejected { message };
                     }
                 };
                 *acknowledged_revision = Some(revision);
@@ -482,10 +443,7 @@ impl PendingEndpointActivation {
                 let revision = match surface_set_revision(&result, true) {
                     Ok(revision) => revision,
                     Err(message) => {
-                        return SurfaceActivationProgress::Rejected {
-                            message,
-                            source_release_rejected: false,
-                        };
+                        return SurfaceActivationProgress::Rejected { message };
                     }
                 };
                 *acknowledged_revision = Some(revision);
@@ -757,7 +715,7 @@ impl PendingEndpointActivation {
         self.source_available = false;
         if self.source.endpoint_id != self.target.endpoint_id {
             match &self.phase {
-                ActivationPhase::ReleasingSource { .. } => {
+                ActivationPhase::ReleasingSource => {
                     return match self.start_target(endpoints, self.resize.clone()) {
                         Ok(()) => ActivationRollback::Pending,
                         Err(message) => ActivationRollback::Unavailable(message),
@@ -774,7 +732,7 @@ impl PendingEndpointActivation {
             }
         }
         match self.phase {
-            ActivationPhase::ReleasingSource { .. } => ActivationRollback::Unavailable(error),
+            ActivationPhase::ReleasingSource => ActivationRollback::Unavailable(error),
             ActivationPhase::ActivatingTarget { .. } => {
                 match self.start_target_release(endpoints) {
                     Ok(()) => ActivationRollback::Pending,
@@ -805,23 +763,10 @@ impl PendingEndpointActivation {
         &mut self,
         endpoints: &mut EndpointRegistry,
         error: String,
-        source_release_rejected: bool,
     ) -> ActivationRollback {
         self.rollback_error = Some(error.clone());
-        if matches!(self.phase, ActivationPhase::ReleasingSource { .. }) && source_release_rejected
-        {
-            // Rejection proves source-off did not commit, but cached source metadata may have
-            // advanced while the frame was frozen. Restore through the same coherent on/sync
-            // path rather than immediately exposing a stale source projection.
-            return match self.start_source_restore(endpoints, self.resize.clone()) {
-                Ok(()) => ActivationRollback::Pending,
-                Err(restore_error) => ActivationRollback::Unavailable(format!(
-                    "{error}; source endpoint could not resume: {restore_error}"
-                )),
-            };
-        }
         let result = match self.phase {
-            ActivationPhase::ReleasingSource { .. } => {
+            ActivationPhase::ReleasingSource => {
                 if self.source_available {
                     self.start_source_restore(endpoints, self.resize.clone())
                 } else {

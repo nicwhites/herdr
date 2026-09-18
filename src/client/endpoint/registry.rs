@@ -473,6 +473,22 @@ mod tests {
     }
 
     #[test]
+    fn unfreeze_input_is_idempotent_across_commit_and_final_branch() {
+        let mut registry = EndpointRegistry::new(
+            FakeTransport {
+                sent: Arc::new(Mutex::new(Vec::new())),
+                error: None,
+            },
+            1,
+            negotiation(),
+        );
+        registry.freeze_input();
+        registry.unfreeze_input();
+        registry.unfreeze_input();
+        assert!(registry.active_surface_available());
+    }
+
+    #[test]
     fn recovered_local_uses_transport_failure_not_remote_health_probes() {
         let mut registry = EndpointRegistry::empty();
         let sent = Arc::new(Mutex::new(Vec::new()));

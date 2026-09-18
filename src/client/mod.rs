@@ -121,6 +121,7 @@ use terminal_sessions::terminal_control_command_from_json;
 
 #[cfg(unix)]
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::io::{self, Write as _};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -365,6 +366,481 @@ fn run_client_with_mode(
 /// - resize poller thread → sends resize events to main loop
 /// - server reader thread → reads ServerMessages and sends to main loop
 /// - main loop: coordinates input, output, and server communication
+const MAX_SURFACE_PRESENTATION_BATCH: usize = 256;
+
+enum SurfaceUpdate {
+    Surface(crate::protocol::PaneSurfaceFrame),
+    Patch(crate::protocol::PaneSurfacePatch),
+}
+
+enum SurfacePresentation {
+    None,
+    FullFrame,
+    Patch(shell::ClientComposedSurfacePatch),
+}
+
+/// Accumulates presentation work across a burst of surface messages so one
+/// drain applies every state update but composes and presents only once.
+#[derive(Default)]
+struct SurfacePresentationBatch {
+    full_frame: bool,
+    patch: Option<shell::ClientComposedSurfacePatch>,
+}
+
+impl SurfacePresentationBatch {
+    fn observe_surface(&mut self) {
+        self.full_frame = true;
+        self.patch = None;
+    }
+
+    fn observe_patch(&mut self, patch: Option<shell::ClientComposedSurfacePatch>) {
+        match patch {
+            Some(patch) if !self.full_frame && self.patch.is_none() => self.patch = Some(patch),
+            Some(_) => {
+                self.full_frame = true;
+                self.patch = None;
+            }
+            None => self.full_frame = true,
+        }
+    }
+
+    fn resolve(self) -> SurfacePresentation {
+        if self.full_frame {
+            SurfacePresentation::FullFrame
+        } else if let Some(patch) = self.patch {
+            SurfacePresentation::Patch(patch)
+        } else {
+            SurfacePresentation::None
+        }
+    }
+
+    fn present(self, state: &mut ClientState) {
+        match self.resolve() {
+            SurfacePresentation::None => {}
+            SurfacePresentation::FullFrame => {
+                let composed = state
+                    .shell
+                    .as_mut()
+                    .and_then(|shell| shell.compose(state.reported_size.0, state.reported_size.1));
+                if let Some(frame) = composed {
+                    state.present_frame(frame);
+                }
+            }
+            SurfacePresentation::Patch(patch) => match state.present_surface_patch(patch) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let composed = state.shell.as_mut().and_then(|shell| {
+                        shell.compose(state.reported_size.0, state.reported_size.1)
+                    });
+                    if let Some(frame) = composed {
+                        state.present_frame(frame);
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, "failed to present retained pane surface patch");
+                    state.request_repaint();
+                }
+            },
+        }
+    }
+}
+
+fn apply_surface_update(
+    state: &mut ClientState,
+    update: SurfaceUpdate,
+    batch: &mut SurfacePresentationBatch,
+) -> bool {
+    match update {
+        SurfaceUpdate::Surface(surface) => {
+            if let Some(shell) = state.shell.as_mut() {
+                shell.set_pane_surface(surface);
+                batch.observe_surface();
+            }
+            false
+        }
+        SurfaceUpdate::Patch(patch) => {
+            let patch_started = crate::render_prof::timer();
+            let apply_started = crate::render_prof::timer();
+            let outcome = state
+                .shell
+                .as_mut()
+                .map(|shell| shell.apply_pane_surface_patch(patch));
+            crate::render_prof::duration_since("client_surface_patch.apply", apply_started);
+            let applied = match outcome {
+                Some(shell::ClientPaneSurfacePatchOutcome::Applied(composed)) => {
+                    batch.observe_patch(composed);
+                    true
+                }
+                _ => false,
+            };
+            crate::render_prof::duration_since("client_surface_patch.total", patch_started);
+            applied
+        }
+    }
+}
+
+/// The first foldable presentation update of a drain turn. Subsequent foldable
+/// server messages drained from the event queue reuse the same shape.
+enum PresentationTurnStart {
+    Surface(SurfaceUpdate),
+    Snapshot(Box<crate::protocol::ClientShellSnapshot>),
+    Response {
+        boot_id: String,
+        request_id: String,
+        final_chunk: bool,
+        data: Vec<u8>,
+    },
+}
+
+fn drainable_presentation_update(
+    write_stream: &endpoint::EndpointRegistry,
+    pending_activation: &Option<endpoint::PendingEndpointActivation>,
+    endpoint_id: &endpoint::ClientEndpointId,
+    generation: u64,
+    message: &crate::protocol::ServerMessage,
+) -> bool {
+    if !write_stream.accepts(endpoint_id, generation) {
+        return false;
+    }
+    let endpoint_active = write_stream.active_id() == endpoint_id
+        && write_stream
+            .connection(endpoint_id)
+            .is_some_and(|connection| connection.surface_active);
+    if !endpoint_active {
+        return false;
+    }
+    if pending_activation
+        .as_ref()
+        .is_some_and(|pending| pending.accepts_endpoint(endpoint_id, generation))
+    {
+        return false;
+    }
+    match message {
+        crate::protocol::ServerMessage::PaneSurface(_)
+        | crate::protocol::ServerMessage::PaneSurfacePatch(_) => true,
+        crate::protocol::ServerMessage::EndpointControl { kind, data } => matches!(
+            endpoint::decode_endpoint_control(kind, data),
+            Ok(endpoint::EndpointControlMessage::Snapshot(_))
+        ),
+        crate::protocol::ServerMessage::ClientShellEndpointResponseChunk { .. } => {
+            pending_activation.is_none()
+        }
+        _ => false,
+    }
+}
+
+fn apply_endpoint_response_chunk(
+    state: &mut ClientState,
+    write_stream: &mut endpoint::EndpointRegistry,
+    pending_activation: &mut Option<endpoint::PendingEndpointActivation>,
+    endpoint_commands: &mut endpoint_commands::EndpointCommands,
+    prefix_input_source: &mut crate::platform::RealPrefixInputSource,
+    scheduled_activation: &mut Option<ClientLoopEvent>,
+    endpoint_id: &endpoint::ClientEndpointId,
+    generation: u64,
+    update: PresentationTurnStart,
+    batch: &mut SurfacePresentationBatch,
+) -> Result<bool, ClientError> {
+    let PresentationTurnStart::Response {
+        boot_id,
+        request_id,
+        final_chunk,
+        data,
+    } = update
+    else {
+        return Ok(false);
+    };
+    if request_id.starts_with("client-shell-surface:") {
+        return Ok(false);
+    }
+    let Some(completed) = endpoint_commands
+        .receive_chunk(
+            endpoint_id,
+            generation,
+            &boot_id,
+            &request_id,
+            final_chunk,
+            data,
+        )
+        .map_err(ClientError::ConnectionLost)?
+    else {
+        return Ok(false);
+    };
+    let (repaint, actions) = state.shell.as_mut().map_or_else(
+        || (false, Vec::new()),
+        |shell| {
+            if completed.generation == generation
+                && shell.endpoint_is_active(&completed.endpoint_id)
+            {
+                shell.handle_endpoint_result(
+                    &completed.boot_id,
+                    &completed.request_id,
+                    completed.result,
+                )
+            } else {
+                (
+                    shell.cancel_endpoint_request(&completed.request_id),
+                    Vec::new(),
+                )
+            }
+        },
+    );
+    if let Some(shell) = state.shell.as_mut() {
+        shell.reconcile_input_source();
+    }
+    apply_client_shell_input_source_changes(state, prefix_input_source);
+    let (replay_mouse, dispatch_repaint) = dispatch_client_shell_actions(
+        actions,
+        endpoint_commands,
+        write_stream,
+        state.shell.as_mut(),
+        &mut state.detached_process_children,
+        scheduled_activation,
+    )?;
+    if replay_mouse.is_empty() {
+        if repaint || dispatch_repaint {
+            batch.observe_surface();
+        }
+        return Ok(false);
+    }
+    let outcome = {
+        let Some(shell) = state.shell.as_mut() else {
+            return Ok(false);
+        };
+        let mut outcome = shell.replay_mouse_events(replay_mouse);
+        outcome.repaint |= repaint || dispatch_repaint;
+        outcome
+    };
+    batch.observe_surface();
+    finish_client_shell_input(
+        state,
+        outcome,
+        None,
+        write_stream,
+        pending_activation,
+        endpoint_commands,
+        prefix_input_source,
+        scheduled_activation,
+    )
+}
+
+fn apply_presentation_turn_update(
+    state: &mut ClientState,
+    write_stream: &mut endpoint::EndpointRegistry,
+    pending_activation: &mut Option<endpoint::PendingEndpointActivation>,
+    endpoint_commands: &mut endpoint_commands::EndpointCommands,
+    prefix_input_source: &mut crate::platform::RealPrefixInputSource,
+    endpoint_catalog: &endpoint::EndpointCatalog,
+    endpoint_id: &endpoint::ClientEndpointId,
+    generation: u64,
+    update: PresentationTurnStart,
+    batch: &mut SurfacePresentationBatch,
+    scheduled_activation: &mut Option<ClientLoopEvent>,
+) -> Result<(bool, bool), ClientError> {
+    match update {
+        PresentationTurnStart::Surface(update) => {
+            Ok((apply_surface_update(state, update, batch), false))
+        }
+        PresentationTurnStart::Snapshot(snapshot) => {
+            install_client_shell_snapshot(
+                state,
+                endpoint_id,
+                snapshot,
+                false,
+                true,
+                write_stream,
+                prefix_input_source,
+            );
+            batch.observe_surface();
+            finish_endpoint_snapshot_install(
+                state,
+                write_stream,
+                pending_activation,
+                endpoint_catalog,
+                endpoint_id,
+                generation,
+                scheduled_activation,
+            );
+            Ok((false, false))
+        }
+        PresentationTurnStart::Response { .. } => apply_endpoint_response_chunk(
+            state,
+            write_stream,
+            pending_activation,
+            endpoint_commands,
+            prefix_input_source,
+            scheduled_activation,
+            endpoint_id,
+            generation,
+            update,
+            batch,
+        )
+        .map(|quit| (false, quit)),
+    }
+}
+
+fn finish_endpoint_snapshot_install(
+    state: &mut ClientState,
+    write_stream: &mut endpoint::EndpointRegistry,
+    pending_activation: &Option<endpoint::PendingEndpointActivation>,
+    endpoint_catalog: &endpoint::EndpointCatalog,
+    endpoint_id: &endpoint::ClientEndpointId,
+    generation: u64,
+    scheduled_activation: &mut Option<ClientLoopEvent>,
+) {
+    write_stream.mark_ready(endpoint_id, generation);
+    if endpoint_id.is_local() {
+        if let Some(event) = take_ready_local_activation(state, write_stream) {
+            *scheduled_activation = Some(event);
+            return;
+        }
+    }
+    let selected_endpoint = endpoint_catalog
+        .selected_profile
+        .as_ref()
+        .map_or(endpoint::ClientEndpointId::Local, |profile_id| {
+            endpoint::ClientEndpointId::Ssh(profile_id.clone())
+        });
+    let activation_ready = state.shell.as_ref().is_some_and(|shell| {
+        shell.endpoint_has_snapshot(&selected_endpoint)
+            && (!write_stream
+                .connection(write_stream.active_id())
+                .is_some_and(|connection| connection.surface_active)
+                || shell.endpoint_boot_id(write_stream.active_id()).is_some())
+    });
+    let needs_surface = write_stream
+        .connection(&selected_endpoint)
+        .is_some_and(|connection| !connection.surface_active);
+    if activation_ready
+        && needs_surface
+        && pending_activation.is_none()
+        && state.deferred_local_activation.is_none()
+    {
+        *scheduled_activation = Some(ClientLoopEvent::ActivateEndpoint {
+            endpoint_id: selected_endpoint,
+            target: None,
+            force: false,
+        });
+    }
+}
+
+/// One presentation turn: applies the starting update plus any queued foldable
+/// snapshot, surface, or response updates, then composes and presents once.
+#[allow(clippy::too_many_arguments)] // one drain turn over loop-owned client state
+fn coalesce_surface_presentation(
+    state: &mut ClientState,
+    write_stream: &mut endpoint::EndpointRegistry,
+    pending_activation: &mut Option<endpoint::PendingEndpointActivation>,
+    endpoint_commands: &mut endpoint_commands::EndpointCommands,
+    event_rx: &mut tokio::sync::mpsc::Receiver<ClientLoopEvent>,
+    drained_events: &mut VecDeque<ClientLoopEvent>,
+    prefix_input_source: &mut crate::platform::RealPrefixInputSource,
+    endpoint_catalog: &endpoint::EndpointCatalog,
+    endpoint_id: &endpoint::ClientEndpointId,
+    generation: u64,
+    now: std::time::Instant,
+    initial: PresentationTurnStart,
+    scheduled_activation: &mut Option<ClientLoopEvent>,
+) -> Result<bool, ClientError> {
+    let mut batch = SurfacePresentationBatch::default();
+    let (mut saw_patch, mut quit) = apply_presentation_turn_update(
+        state,
+        write_stream,
+        pending_activation,
+        endpoint_commands,
+        prefix_input_source,
+        endpoint_catalog,
+        endpoint_id,
+        generation,
+        initial,
+        &mut batch,
+        scheduled_activation,
+    )?;
+    apply_client_shell_input_source_changes(state, prefix_input_source);
+    let mut batched = 0_usize;
+    while batched < MAX_SURFACE_PRESENTATION_BATCH {
+        let Ok(event) = event_rx.try_recv() else {
+            break;
+        };
+        let drainable = match &event {
+            ClientLoopEvent::ServerMessage {
+                endpoint_id: message_endpoint,
+                generation: message_generation,
+                message,
+            } => {
+                message_endpoint == endpoint_id
+                    && *message_generation == generation
+                    && drainable_presentation_update(
+                        write_stream,
+                        pending_activation,
+                        endpoint_id,
+                        generation,
+                        message.as_ref(),
+                    )
+            }
+            _ => false,
+        };
+        if !drainable {
+            drained_events.push_back(event);
+            break;
+        }
+        let ClientLoopEvent::ServerMessage { message, .. } = event else {
+            continue;
+        };
+        write_stream.received(endpoint_id, generation, now);
+        batched += 1;
+        let update = match *message {
+            crate::protocol::ServerMessage::PaneSurface(surface) => {
+                PresentationTurnStart::Surface(SurfaceUpdate::Surface(surface))
+            }
+            crate::protocol::ServerMessage::PaneSurfacePatch(patch) => {
+                PresentationTurnStart::Surface(SurfaceUpdate::Patch(patch))
+            }
+            crate::protocol::ServerMessage::EndpointControl { kind, data } => {
+                match endpoint::decode_endpoint_control(&kind, &data) {
+                    Ok(endpoint::EndpointControlMessage::Snapshot(snapshot)) => {
+                        PresentationTurnStart::Snapshot(snapshot)
+                    }
+                    _ => continue,
+                }
+            }
+            crate::protocol::ServerMessage::ClientShellEndpointResponseChunk {
+                boot_id,
+                request_id,
+                final_chunk,
+                data,
+            } => PresentationTurnStart::Response {
+                boot_id,
+                request_id,
+                final_chunk,
+                data,
+            },
+            _ => continue,
+        };
+        let (update_saw_patch, update_quit) = apply_presentation_turn_update(
+            state,
+            write_stream,
+            pending_activation,
+            endpoint_commands,
+            prefix_input_source,
+            endpoint_catalog,
+            endpoint_id,
+            generation,
+            update,
+            &mut batch,
+            scheduled_activation,
+        )?;
+        saw_patch |= update_saw_patch;
+        quit |= update_quit;
+        apply_client_shell_input_source_changes(state, prefix_input_source);
+    }
+    batch.present(state);
+    if saw_patch {
+        crate::render_prof::flush_if_due();
+    }
+    Ok(quit)
+}
+
 async fn run_client_loop(
     initial: Option<(LocalStream, handshake::HandshakeResult)>,
     mut endpoint_catalog: endpoint::EndpointCatalog,
@@ -585,6 +1061,7 @@ async fn run_client_loop(
     let mut pending_activation: Option<endpoint::PendingEndpointActivation> = None;
     let mut scheduled_activation = None;
     let mut pending_catalog: Option<Result<Vec<endpoint::SavedSshEndpoint>, String>> = None;
+    let mut drained_events: VecDeque<ClientLoopEvent> = VecDeque::new();
     if state.shell.is_some() && !is_remote_client && state.attach_escape.is_none() {
         catalog_reload::watch_profiles(event_tx.clone(), should_quit.clone());
     }
@@ -714,6 +1191,8 @@ async fn run_client_loop(
         #[cfg(windows)]
         let event = if let Some(event) = immediate_event {
             event
+        } else if let Some(event) = drained_events.pop_front() {
+            event
         } else {
             tokio::select! {
                 _ = tokio::time::sleep_until(timer_deadline.into()) => ClientLoopEvent::Timer,
@@ -730,6 +1209,8 @@ async fn run_client_loop(
         };
         #[cfg(unix)]
         let event = if let Some(event) = immediate_event {
+            event
+        } else if let Some(event) = drained_events.pop_front() {
             event
         } else {
             tokio::select! {
@@ -1152,7 +1633,6 @@ async fn run_client_loop(
                             &mut write_stream,
                             &mut pending_activation,
                             error,
-                            false,
                         );
                     }
                 } else if let Err(e) = write_to_server(&mut write_stream, &msg) {
@@ -1361,62 +1841,47 @@ async fn run_client_loop(
                         if !endpoint_active {
                             continue;
                         }
-                        let composed = if let Some(shell) = &mut state.shell {
-                            shell.set_pane_surface(surface);
-                            shell.compose(state.reported_size.0, state.reported_size.1)
-                        } else {
-                            None
-                        };
-                        apply_client_shell_input_source_changes(
+                        let quit = coalesce_surface_presentation(
                             &mut state,
+                            &mut write_stream,
+                            &mut pending_activation,
+                            &mut endpoint_commands,
+                            &mut event_rx,
+                            &mut drained_events,
                             &mut prefix_input_source,
-                        );
-                        if let Some(frame) = composed {
-                            state.present_frame(frame);
+                            &endpoint_catalog,
+                            &endpoint_id,
+                            generation,
+                            now,
+                            PresentationTurnStart::Surface(SurfaceUpdate::Surface(surface)),
+                            &mut scheduled_activation,
+                        )?;
+                        if quit {
+                            return Ok(());
                         }
                     }
                     ServerMessage::PaneSurfacePatch(patch) => {
-                        let patch_started = crate::render_prof::timer();
-                        let apply_started = crate::render_prof::timer();
-                        let outcome = state
-                            .shell
-                            .as_mut()
-                            .map(|shell| shell.apply_pane_surface_patch(patch));
-                        crate::render_prof::duration_since(
-                            "client_surface_patch.apply",
-                            apply_started,
-                        );
-                        let compose_fallback = match outcome {
-                            Some(shell::ClientPaneSurfacePatchOutcome::Applied(Some(patch))) => {
-                                match state.present_surface_patch(patch) {
-                                    Ok(presented) => !presented,
-                                    Err(error) => {
-                                        warn!(%error, "failed to present retained pane surface patch");
-                                        state.request_repaint();
-                                        false
-                                    }
-                                }
-                            }
-                            Some(shell::ClientPaneSurfacePatchOutcome::Applied(None)) => true,
-                            Some(shell::ClientPaneSurfacePatchOutcome::Rejected) | None => false,
-                        };
-                        apply_client_shell_input_source_changes(
-                            &mut state,
-                            &mut prefix_input_source,
-                        );
-                        if compose_fallback {
-                            let composed = state.shell.as_mut().and_then(|shell| {
-                                shell.compose(state.reported_size.0, state.reported_size.1)
-                            });
-                            if let Some(frame) = composed {
-                                state.present_frame(frame);
-                            }
+                        if !endpoint_active {
+                            continue;
                         }
-                        crate::render_prof::duration_since(
-                            "client_surface_patch.total",
-                            patch_started,
-                        );
-                        crate::render_prof::flush_if_due();
+                        let quit = coalesce_surface_presentation(
+                            &mut state,
+                            &mut write_stream,
+                            &mut pending_activation,
+                            &mut endpoint_commands,
+                            &mut event_rx,
+                            &mut drained_events,
+                            &mut prefix_input_source,
+                            &endpoint_catalog,
+                            &endpoint_id,
+                            generation,
+                            now,
+                            PresentationTurnStart::Surface(SurfaceUpdate::Patch(patch)),
+                            &mut scheduled_activation,
+                        )?;
+                        if quit {
+                            return Ok(());
+                        }
                     }
                     ServerMessage::Terminal(frame) => {
                         if state.kitty_graphics_enabled
@@ -1656,7 +2121,6 @@ async fn run_client_loop(
                                     &mut write_stream,
                                     &mut pending_activation,
                                     "endpoint returned a chunked activation acknowledgement".into(),
-                                    false,
                                 );
                                 continue;
                             }
@@ -1681,106 +2145,40 @@ async fn run_client_loop(
                                         scheduled_activation = Some(event);
                                     }
                                 }
-                                Some(endpoint::SurfaceActivationProgress::Rejected {
-                                    message,
-                                    source_release_rejected,
-                                }) => {
+                                Some(endpoint::SurfaceActivationProgress::Rejected { message }) => {
                                     rollback_endpoint_activation(
                                         &mut state,
                                         &mut write_stream,
                                         &mut pending_activation,
                                         message,
-                                        source_release_rejected,
                                     );
                                 }
                                 _ => {}
                             }
                             continue;
                         }
-                        if request_id.starts_with("client-shell-surface:") {
-                            continue;
-                        }
-                        let completed = endpoint_commands
-                            .receive_chunk(
-                                &endpoint_id,
-                                generation,
-                                &boot_id,
-                                &request_id,
+                        let quit = coalesce_surface_presentation(
+                            &mut state,
+                            &mut write_stream,
+                            &mut pending_activation,
+                            &mut endpoint_commands,
+                            &mut event_rx,
+                            &mut drained_events,
+                            &mut prefix_input_source,
+                            &endpoint_catalog,
+                            &endpoint_id,
+                            generation,
+                            now,
+                            PresentationTurnStart::Response {
+                                boot_id,
+                                request_id,
                                 final_chunk,
                                 data,
-                            )
-                            .map_err(ClientError::ConnectionLost)?;
-                        let Some(completed) = completed else {
-                            continue;
-                        };
-                        let (repaint, actions) = state.shell.as_mut().map_or_else(
-                            || (false, Vec::new()),
-                            |shell| {
-                                if completed.generation == generation
-                                    && shell.endpoint_is_active(&completed.endpoint_id)
-                                {
-                                    shell.handle_endpoint_result(
-                                        &completed.boot_id,
-                                        &completed.request_id,
-                                        completed.result,
-                                    )
-                                } else {
-                                    (
-                                        shell.cancel_endpoint_request(&completed.request_id),
-                                        Vec::new(),
-                                    )
-                                }
                             },
-                        );
-                        if let Some(shell) = state.shell.as_mut() {
-                            shell.reconcile_input_source();
-                        }
-                        apply_client_shell_input_source_changes(
-                            &mut state,
-                            &mut prefix_input_source,
-                        );
-                        let (replay_mouse, dispatch_repaint) = dispatch_client_shell_actions(
-                            actions,
-                            &mut endpoint_commands,
-                            &mut write_stream,
-                            state.shell.as_mut(),
-                            &mut state.detached_process_children,
                             &mut scheduled_activation,
                         )?;
-                        let repaint = repaint || dispatch_repaint;
-                        if replay_mouse.is_empty() {
-                            if repaint {
-                                if let Some(frame) = state.shell.as_mut().and_then(|shell| {
-                                    shell.compose(state.reported_size.0, state.reported_size.1)
-                                }) {
-                                    state.present_frame(frame);
-                                }
-                            }
-                        } else {
-                            let (outcome, frame) = {
-                                let shell = state.shell.as_mut().expect("shell endpoint response");
-                                let mut outcome = shell.replay_mouse_events(replay_mouse);
-                                outcome.repaint |= repaint;
-                                let frame = outcome
-                                    .repaint
-                                    .then(|| {
-                                        shell.compose(state.reported_size.0, state.reported_size.1)
-                                    })
-                                    .flatten();
-                                (outcome, frame)
-                            };
-                            if finish_client_shell_input(
-                                &mut state,
-                                outcome,
-                                frame,
-                                &mut write_stream,
-                                &mut pending_activation,
-                                &mut endpoint_commands,
-                                &mut prefix_input_source,
-                                &mut scheduled_activation,
-                            )? {
-                                return Ok(());
-                            }
+                        if quit {
+                            return Ok(());
                         }
                     }
                     ServerMessage::Clipboard { data } => {
@@ -1945,62 +2343,60 @@ async fn run_client_loop(
                                 })
                             })
                             .flatten();
-                        install_client_shell_snapshot(
-                            &mut state,
-                            &endpoint_id,
-                            snapshot,
-                            projection_pending,
-                            &mut write_stream,
-                            &mut prefix_input_source,
-                        )?;
-                        if matches!(
-                            activation_progress,
-                            Some(endpoint::SurfaceActivationProgress::Ready)
-                        ) {
-                            if let Some(event) = complete_endpoint_activation(
+                        if projection_pending {
+                            let composed = install_client_shell_snapshot(
+                                &mut state,
+                                &endpoint_id,
+                                snapshot,
+                                true,
+                                false,
+                                &mut write_stream,
+                                &mut prefix_input_source,
+                            );
+                            if let Some(frame) = composed {
+                                state.present_frame(frame);
+                            }
+                            if matches!(
+                                activation_progress,
+                                Some(endpoint::SurfaceActivationProgress::Ready)
+                            ) {
+                                if let Some(event) = complete_endpoint_activation(
+                                    &mut state,
+                                    &mut write_stream,
+                                    &mut pending_activation,
+                                    &mut endpoint_commands,
+                                )? {
+                                    scheduled_activation = Some(event);
+                                }
+                            }
+                            finish_endpoint_snapshot_install(
+                                &mut state,
+                                &mut write_stream,
+                                &pending_activation,
+                                &endpoint_catalog,
+                                &endpoint_id,
+                                generation,
+                                &mut scheduled_activation,
+                            );
+                        } else {
+                            let quit = coalesce_surface_presentation(
                                 &mut state,
                                 &mut write_stream,
                                 &mut pending_activation,
                                 &mut endpoint_commands,
-                            )? {
-                                scheduled_activation = Some(event);
+                                &mut event_rx,
+                                &mut drained_events,
+                                &mut prefix_input_source,
+                                &endpoint_catalog,
+                                &endpoint_id,
+                                generation,
+                                now,
+                                PresentationTurnStart::Snapshot(snapshot),
+                                &mut scheduled_activation,
+                            )?;
+                            if quit {
+                                return Ok(());
                             }
-                        }
-                        write_stream.mark_ready(&endpoint_id, generation);
-                        if endpoint_id.is_local() {
-                            if let Some(event) =
-                                take_ready_local_activation(&mut state, &write_stream)
-                            {
-                                scheduled_activation = Some(event);
-                                continue;
-                            }
-                        }
-                        let selected_endpoint = endpoint_catalog
-                            .selected_profile
-                            .as_ref()
-                            .map_or(endpoint::ClientEndpointId::Local, |profile_id| {
-                                endpoint::ClientEndpointId::Ssh(profile_id.clone())
-                            });
-                        let activation_ready = state.shell.as_ref().is_some_and(|shell| {
-                            shell.endpoint_has_snapshot(&selected_endpoint)
-                                && (!write_stream
-                                    .connection(write_stream.active_id())
-                                    .is_some_and(|connection| connection.surface_active)
-                                    || shell.endpoint_boot_id(write_stream.active_id()).is_some())
-                        });
-                        let needs_surface = write_stream
-                            .connection(&selected_endpoint)
-                            .is_some_and(|connection| !connection.surface_active);
-                        if activation_ready
-                            && needs_surface
-                            && pending_activation.is_none()
-                            && state.deferred_local_activation.is_none()
-                        {
-                            scheduled_activation = Some(ClientLoopEvent::ActivateEndpoint {
-                                endpoint_id: selected_endpoint,
-                                target: None,
-                                force: false,
-                            });
                         }
                     }
                     ServerMessage::Welcome { .. } => {
@@ -2085,7 +2481,6 @@ async fn run_client_loop(
                         &mut write_stream,
                         &mut pending_activation,
                         format!("{label} did not produce a coherent surface in time"),
-                        false,
                     );
                 }
                 if state.shell.is_some() {
@@ -2145,6 +2540,422 @@ async fn run_client_loop(
     let _ = io::stdout().flush();
 
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_PRESENTATION_COMPOSES: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod surface_presentation_tests {
+    use super::*;
+
+    struct NoopTransport;
+
+    impl endpoint::EndpointTransport for NoopTransport {
+        fn send(&mut self, _message: &crate::protocol::ClientMessage) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn composed_patch() -> shell::ClientComposedSurfacePatch {
+        shell::ClientComposedSurfacePatch {
+            rows: Vec::new(),
+            cursor: None,
+        }
+    }
+
+    fn surface_patch(surface_revision: u64) -> crate::protocol::PaneSurfacePatch {
+        crate::protocol::PaneSurfacePatch {
+            boot_id: "boot-1".into(),
+            projection_revision: 1,
+            base_surface_revision: surface_revision,
+            surface_revision: surface_revision + 1,
+            rows: Vec::new(),
+            panes: Vec::new(),
+            cursor: None,
+        }
+    }
+
+    fn surface_message_event(patch: crate::protocol::PaneSurfacePatch) -> ClientLoopEvent {
+        ClientLoopEvent::ServerMessage {
+            endpoint_id: endpoint::ClientEndpointId::Local,
+            generation: 1,
+            message: Box::new(crate::protocol::ServerMessage::PaneSurfacePatch(patch)),
+        }
+    }
+
+    #[test]
+    fn repeated_surface_messages_coalesce_into_one_full_frame_presentation() {
+        let mut batch = SurfacePresentationBatch::default();
+        for _ in 0..8 {
+            batch.observe_surface();
+        }
+        assert!(matches!(batch.resolve(), SurfacePresentation::FullFrame));
+    }
+
+    #[test]
+    fn repeated_patch_messages_present_once() {
+        let mut batch = SurfacePresentationBatch::default();
+        batch.observe_patch(Some(composed_patch()));
+        assert!(matches!(batch.resolve(), SurfacePresentation::Patch(_)));
+
+        let mut batch = SurfacePresentationBatch::default();
+        for _ in 0..8 {
+            batch.observe_patch(Some(composed_patch()));
+        }
+        assert!(!matches!(batch.resolve(), SurfacePresentation::None));
+    }
+
+    #[test]
+    fn a_surface_message_supersedes_pending_patch_presentation() {
+        let mut batch = SurfacePresentationBatch::default();
+        batch.observe_patch(Some(composed_patch()));
+        batch.observe_surface();
+        assert!(matches!(batch.resolve(), SurfacePresentation::FullFrame));
+
+        let mut batch = SurfacePresentationBatch::default();
+        batch.observe_surface();
+        batch.observe_patch(Some(composed_patch()));
+        assert!(matches!(batch.resolve(), SurfacePresentation::FullFrame));
+    }
+
+    #[test]
+    fn patch_fallback_presents_full_frame_and_empty_batch_presents_nothing() {
+        let mut batch = SurfacePresentationBatch::default();
+        batch.observe_patch(None);
+        assert!(matches!(batch.resolve(), SurfacePresentation::FullFrame));
+
+        assert!(matches!(
+            SurfacePresentationBatch::default().resolve(),
+            SurfacePresentation::None
+        ));
+    }
+
+    #[test]
+    fn surface_drain_applies_queued_surfaces_and_preserves_other_messages() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(64);
+        for surface_revision in 1..6_u64 {
+            event_tx
+                .blocking_send(surface_message_event(surface_patch(surface_revision)))
+                .expect("surface event queued");
+        }
+        event_tx
+            .blocking_send(ClientLoopEvent::ServerMessage {
+                endpoint_id: endpoint::ClientEndpointId::Local,
+                generation: 1,
+                message: Box::new(crate::protocol::ServerMessage::Terminal(
+                    crate::protocol::TerminalFrame {
+                        seq: 0,
+                        width: 0,
+                        height: 0,
+                        full: false,
+                        bytes: Vec::new(),
+                    },
+                )),
+            })
+            .expect("terminal event queued");
+
+        let mut state = ClientState::test_new();
+        let mut write_stream =
+            endpoint::EndpointRegistry::new(NoopTransport, 1, Default::default());
+        let mut drained_events = VecDeque::new();
+        let mut prefix_input_source = crate::platform::RealPrefixInputSource::default();
+        let quit = coalesce_surface_presentation(
+            &mut state,
+            &mut write_stream,
+            &mut None,
+            &mut endpoint_commands::EndpointCommands::default(),
+            &mut event_rx,
+            &mut drained_events,
+            &mut prefix_input_source,
+            &endpoint::EndpointCatalog::default(),
+            &endpoint::ClientEndpointId::Local,
+            1,
+            std::time::Instant::now(),
+            PresentationTurnStart::Surface(SurfaceUpdate::Patch(surface_patch(0))),
+            &mut None,
+        )
+        .unwrap_or(false);
+
+        assert!(!quit);
+        assert!(event_rx.try_recv().is_err(), "all surface events drained");
+        assert_eq!(drained_events.len(), 1);
+        assert!(matches!(
+            drained_events.pop_front(),
+            Some(ClientLoopEvent::ServerMessage { message, .. })
+                if matches!(*message, crate::protocol::ServerMessage::Terminal(_))
+        ));
+    }
+
+    fn test_shell_snapshot(revision: u64) -> crate::protocol::ClientShellSnapshot {
+        crate::protocol::ClientShellSnapshot {
+            boot_id: "boot-1".into(),
+            revision,
+            config_diagnostic: None,
+            product_announcement: None,
+            update_available: None,
+            update_install_command: "herdr update".into(),
+            server_keybindings_toml: None,
+            latest_release_notes_available: false,
+            integration_updates_available: false,
+            worktree_directory: "/tmp/herdr-worktrees".into(),
+            release_notes: None,
+            focused_workspace_id: Some("ws_1".into()),
+            focused_tab_id: Some("tab_1".into()),
+            focused_pane_id: Some("pane_1".into()),
+            tab_bar_right: Vec::new(),
+            tab_bar_right_separator: " ".into(),
+            agent_view_label: None,
+            agent_order: Vec::new(),
+            workspaces: vec![crate::protocol::ClientShellWorkspace {
+                workspace_id: "ws_1".into(),
+                active_tab_id: "tab_1".into(),
+                new_workspace_cwd: "/repo".into(),
+                number: 1,
+                label: "client-shell".into(),
+                custom_label: false,
+                branch: Some("main".into()),
+                git_ahead_behind: None,
+                tokens: Vec::new(),
+                worktree: None,
+                focused: true,
+                agent_status: crate::api::schema::AgentStatus::Idle,
+            }],
+            tabs: vec![crate::protocol::ClientShellTab {
+                tab_id: "tab_1".into(),
+                workspace_id: "ws_1".into(),
+                number: 1,
+                label: "1".into(),
+                custom_label: false,
+                zoomed: false,
+                focused: true,
+                agent_status: crate::api::schema::AgentStatus::Idle,
+            }],
+            panes: vec![crate::protocol::ClientShellPane {
+                pane_id: "pane_1".into(),
+                workspace_id: "ws_1".into(),
+                tab_id: "tab_1".into(),
+                label: None,
+                cwd: Some("/repo".into()),
+                foreground_cwd: Some("/repo".into()),
+                focused: true,
+                right_click_passthrough: false,
+            }],
+            agents: Vec::new(),
+            commands: Vec::new(),
+        }
+    }
+
+    fn test_surface(projection_revision: u64) -> crate::protocol::PaneSurfaceFrame {
+        let surface_buffer = ratatui::buffer::Buffer::with_lines(["LIVE", "PANE"]);
+        crate::protocol::PaneSurfaceFrame {
+            boot_id: "boot-1".into(),
+            projection_revision,
+            surface_revision: 1,
+            frame: FrameData::from_ratatui_buffer_with_hyperlinks(&surface_buffer, None, &[]),
+            panes: vec![crate::protocol::PaneSurfacePane {
+                pane_id: "pane_1".into(),
+                content_revision: 0,
+                rect: crate::protocol::SurfaceRect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 2,
+                },
+                inner_rect: crate::protocol::SurfaceRect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 2,
+                },
+                scrollbar_rect: None,
+                scroll: None,
+                focused: true,
+                mouse_reporting: false,
+                sgr_pixel_mouse: false,
+                alternate_screen_active: false,
+                pixel_width: 0,
+                pixel_height: 0,
+            }],
+            splits: Vec::new(),
+            popup: None,
+            graphics: crate::protocol::SurfaceGraphicsScene::default(),
+        }
+    }
+
+    fn snapshot_message_event(snapshot: &crate::protocol::ClientShellSnapshot) -> ClientLoopEvent {
+        ClientLoopEvent::ServerMessage {
+            endpoint_id: endpoint::ClientEndpointId::Local,
+            generation: 1,
+            message: Box::new(crate::protocol::ServerMessage::EndpointControl {
+                kind: crate::protocol::endpoint::ENDPOINT_SNAPSHOT_KIND.into(),
+                data: serde_json::to_string(snapshot).expect("snapshot encodes"),
+            }),
+        }
+    }
+
+    fn pane_surface_message_event(surface: crate::protocol::PaneSurfaceFrame) -> ClientLoopEvent {
+        ClientLoopEvent::ServerMessage {
+            endpoint_id: endpoint::ClientEndpointId::Local,
+            generation: 1,
+            message: Box::new(crate::protocol::ServerMessage::PaneSurface(surface)),
+        }
+    }
+
+    fn seed_presentable_pair(state: &mut ClientState, revision: u64) {
+        let shell = state.shell.as_mut().expect("test shell");
+        shell.set_endpoint_snapshot_for_generation(
+            &endpoint::ClientEndpointId::Local,
+            1,
+            Box::new(test_shell_snapshot(revision)),
+        );
+        shell.set_pane_surface(test_surface(revision));
+    }
+
+    #[test]
+    fn snapshot_and_surface_burst_in_one_drain_turn_composes_once() {
+        let mut state = ClientState::test_new();
+        seed_presentable_pair(&mut state, 1);
+
+        let next_snapshot = test_shell_snapshot(2);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(8);
+        event_tx
+            .blocking_send(pane_surface_message_event(test_surface(2)))
+            .expect("surface event queued");
+        event_tx
+            .blocking_send(ClientLoopEvent::ServerMessage {
+                endpoint_id: endpoint::ClientEndpointId::Local,
+                generation: 1,
+                message: Box::new(crate::protocol::ServerMessage::Terminal(
+                    crate::protocol::TerminalFrame {
+                        seq: 0,
+                        width: 0,
+                        height: 0,
+                        full: false,
+                        bytes: Vec::new(),
+                    },
+                )),
+            })
+            .expect("terminal event queued");
+
+        let mut write_stream =
+            endpoint::EndpointRegistry::new(NoopTransport, 1, Default::default());
+        let mut drained_events = VecDeque::new();
+        let mut prefix_input_source = crate::platform::RealPrefixInputSource::default();
+        TEST_PRESENTATION_COMPOSES.with(|count| count.set(0));
+        let quit = coalesce_surface_presentation(
+            &mut state,
+            &mut write_stream,
+            &mut None,
+            &mut endpoint_commands::EndpointCommands::default(),
+            &mut event_rx,
+            &mut drained_events,
+            &mut prefix_input_source,
+            &endpoint::EndpointCatalog::default(),
+            &endpoint::ClientEndpointId::Local,
+            1,
+            std::time::Instant::now(),
+            PresentationTurnStart::Snapshot(Box::new(next_snapshot)),
+            &mut None,
+        )
+        .unwrap_or(false);
+
+        assert!(!quit);
+        let composes = TEST_PRESENTATION_COMPOSES.with(|count| count.get());
+        assert_eq!(composes, 1, "snapshot + surface must compose once per turn");
+        assert_eq!(drained_events.len(), 1);
+        assert!(matches!(
+            drained_events.pop_front(),
+            Some(ClientLoopEvent::ServerMessage { message, .. })
+                if matches!(*message, crate::protocol::ServerMessage::Terminal(_))
+        ));
+    }
+
+    #[test]
+    fn revision_skewed_surface_writes_nothing() {
+        let mut state = ClientState::test_new();
+        seed_presentable_pair(&mut state, 1);
+        state.request_repaint();
+
+        let mut write_stream =
+            endpoint::EndpointRegistry::new(NoopTransport, 1, Default::default());
+        let mut drained_events = VecDeque::new();
+        let mut prefix_input_source = crate::platform::RealPrefixInputSource::default();
+        let mut event_rx = event_rx_placeholder();
+        TEST_PRESENTATION_COMPOSES.with(|count| count.set(0));
+        let quit = coalesce_surface_presentation(
+            &mut state,
+            &mut write_stream,
+            &mut None,
+            &mut endpoint_commands::EndpointCommands::default(),
+            &mut event_rx,
+            &mut drained_events,
+            &mut prefix_input_source,
+            &endpoint::EndpointCatalog::default(),
+            &endpoint::ClientEndpointId::Local,
+            1,
+            std::time::Instant::now(),
+            PresentationTurnStart::Surface(SurfaceUpdate::Surface(test_surface(5))),
+            &mut None,
+        )
+        .unwrap_or(false);
+
+        assert!(!quit);
+        let composes = TEST_PRESENTATION_COMPOSES.with(|count| count.get());
+        assert_eq!(composes, 1, "batch attempts exactly one compose");
+        assert!(
+            state.repaint_pending,
+            "stale surface must not present a frame"
+        );
+    }
+
+    fn event_rx_placeholder() -> tokio::sync::mpsc::Receiver<ClientLoopEvent> {
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(8);
+        drop(event_tx);
+        event_rx
+    }
+
+    #[test]
+    fn matching_snapshot_after_skewed_surface_presents_once_in_same_turn() {
+        let mut state = ClientState::test_new();
+        seed_presentable_pair(&mut state, 1);
+
+        let matching_snapshot = test_shell_snapshot(5);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(8);
+        event_tx
+            .blocking_send(snapshot_message_event(&matching_snapshot))
+            .expect("snapshot event queued");
+
+        let mut write_stream =
+            endpoint::EndpointRegistry::new(NoopTransport, 1, Default::default());
+        let mut drained_events = VecDeque::new();
+        let mut prefix_input_source = crate::platform::RealPrefixInputSource::default();
+        TEST_PRESENTATION_COMPOSES.with(|count| count.set(0));
+        let quit = coalesce_surface_presentation(
+            &mut state,
+            &mut write_stream,
+            &mut None,
+            &mut endpoint_commands::EndpointCommands::default(),
+            &mut event_rx,
+            &mut drained_events,
+            &mut prefix_input_source,
+            &endpoint::EndpointCatalog::default(),
+            &endpoint::ClientEndpointId::Local,
+            1,
+            std::time::Instant::now(),
+            PresentationTurnStart::Surface(SurfaceUpdate::Surface(test_surface(5))),
+            &mut None,
+        )
+        .unwrap_or(false);
+
+        assert!(!quit);
+        let composes = TEST_PRESENTATION_COMPOSES.with(|count| count.get());
+        assert_eq!(composes, 1, "follow-up snapshot presents exactly once");
+        assert!(event_rx.try_recv().is_err(), "snapshot event was drained");
+    }
 }
 
 #[cfg(test)]

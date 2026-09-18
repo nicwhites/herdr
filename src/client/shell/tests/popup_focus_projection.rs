@@ -1133,6 +1133,76 @@ fn retained_surface_patch_recomposes_client_owned_mode_and_diagnostic_rows() {
 }
 
 #[test]
+fn retained_surface_patch_without_composed_size_falls_back_to_full_compose() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    let pane_surface = surface();
+    let mut updated_pane = pane_surface.panes[0].clone();
+    updated_pane.content_revision = 2;
+    state.set_pane_surface(pane_surface);
+    state.hits.panes = state
+        .pane_surface
+        .as_ref()
+        .map(|installed| {
+            installed
+                .panes
+                .iter()
+                .map(|pane| PaneHit {
+                    rect: Rect::new(pane.rect.x, pane.rect.y, pane.rect.width, pane.rect.height),
+                    inner_rect: Rect::new(
+                        pane.inner_rect.x,
+                        pane.inner_rect.y,
+                        pane.inner_rect.width,
+                        pane.inner_rect.height,
+                    ),
+                    scrollbar_rect: None,
+                    scroll: None,
+                    pane_id: pane.pane_id.clone(),
+                    popup: false,
+                    mouse_reporting: false,
+                    sgr_pixel_mouse: false,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let patch = crate::protocol::PaneSurfacePatch {
+        boot_id: "boot-1".into(),
+        projection_revision: 1,
+        base_surface_revision: 1,
+        surface_revision: 2,
+        rows: vec![crate::protocol::PaneSurfacePatchRow {
+            x: 0,
+            y: 0,
+            cells: vec![
+                crate::protocol::CellData {
+                    symbol: "N".into(),
+                    fg: 0,
+                    bg: 0,
+                    modifier: 0,
+                    skip: false,
+                    hyperlink: None,
+                };
+                4
+            ],
+        }],
+        panes: vec![updated_pane],
+        cursor: None,
+    };
+
+    assert!(matches!(
+        state.apply_pane_surface_patch(patch),
+        ClientPaneSurfacePatchOutcome::Applied(None)
+    ));
+    assert_eq!(state.pane_surface.as_ref().unwrap().surface_revision, 2);
+    assert_eq!(
+        state.pane_surface.as_ref().unwrap().panes[0].content_revision,
+        2
+    );
+}
+
+#[test]
 fn retained_surface_patch_updates_scrollbar_cells_and_pane_hit_metadata() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     state.set_snapshot(Box::new(snapshot()));
