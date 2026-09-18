@@ -102,9 +102,9 @@ fn state_with_scrollable_agents() -> (ClientShellState, ClientEndpointId) {
             .collect();
         state.set_endpoint_snapshot(&endpoint_id, projection);
     }
-    state.compose(100, 28).unwrap();
+    state.compose(100, 48).unwrap();
     state.agent_scroll = 6;
-    state.compose(100, 28).unwrap();
+    state.compose(100, 48).unwrap();
     assert_eq!(state.agent_scroll, 6);
     (state, remote)
 }
@@ -291,7 +291,7 @@ fn switching_machines_preserves_aggregate_agent_scroll_and_visible_rows() {
         let mut next_surface = surface();
         next_surface.boot_id = state.endpoint_boot_id(&endpoint_id).unwrap().into();
         state.set_pane_surface(next_surface);
-        state.compose(100, 28).unwrap();
+        state.compose(100, 48).unwrap();
         assert_eq!(state.agent_scroll, 6);
         assert_eq!(state.hits.endpoint_agents, visible);
     }
@@ -305,7 +305,7 @@ fn local_agent_click_can_cancel_a_pending_remote_switch() {
         if reconnecting {
             state.mark_endpoint_disconnected(&ClientEndpointId::Local);
         }
-        state.compose(100, 28).unwrap();
+        state.compose(100, 48).unwrap();
         let (rect, _, pane_id) = state
             .hits
             .endpoint_agents
@@ -345,7 +345,7 @@ fn aggregate_agent_scroll_still_clamps_when_rows_shrink_on_activation() {
         state.set_endpoint_snapshot(&endpoint_id, projection);
     }
     assert!(state.activate_endpoint_projection(&remote));
-    state.compose(100, 28).unwrap();
+    state.compose(100, 48).unwrap();
     assert_eq!(state.agent_scroll, 0);
     assert_eq!(state.hits.agent_max_scroll, 0);
     assert_eq!(state.hits.endpoint_agents.len(), 2);
@@ -1032,6 +1032,132 @@ fn aggregate_agents_use_configured_rows_machine_token_and_status_colors() {
         .content()
         .iter()
         .any(|cell| cell.symbol() == "×" && cell.fg == state.config.palette.red));
+}
+
+#[test]
+fn aggregate_agent_panel_groups_by_machine() {
+    use crate::api::schema::AgentStatus;
+    use crate::config::{AgentSidebarToken, StatusIndicatorStyle};
+
+    let mut config = Config::default();
+    config.ui.status_indicators = StatusIndicatorStyle::Symbols;
+    config.ui.sidebar.agents.rows = vec![vec![
+        AgentSidebarToken::StateIcon,
+        AgentSidebarToken::Machine,
+        AgentSidebarToken::Agent,
+    ]];
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    let profile = remote_profile();
+    let endpoint_id = ClientEndpointId::Ssh(profile.id.clone());
+    state.set_endpoint_catalog(&[profile]);
+    state.set_endpoint_status(&endpoint_id, ClientEndpointStatus::Online);
+
+    let mut local = snapshot();
+    local.agents = vec![
+        agent("pi one", AgentStatus::Working, 1),
+        ClientShellAgent {
+            name: Some("pi two".into()),
+            agent_status: AgentStatus::Blocked,
+            state_change_seq: 2,
+            focused: false,
+            ..agent("pi two", AgentStatus::Blocked, 2)
+        },
+    ];
+    state.set_snapshot(Box::new(local));
+    state.set_pane_surface(surface());
+
+    let mut remote = snapshot();
+    remote.boot_id = "remote-boot".into();
+    remote.agents = vec![agent("remote pi", AgentStatus::Idle, 1)];
+    state.set_endpoint_snapshot(&endpoint_id, Box::new(remote));
+
+    let frame = state.compose(100, 32).expect("grouped aggregate frame");
+    let text = frame
+        .cells
+        .chunks(frame.width as usize)
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("▾ Local"), "frame: {text}");
+    assert!(text.contains("▾ Build"), "frame: {text}");
+    assert!(text.contains("pi one"), "frame: {text}");
+    assert!(text.contains("pi two"), "frame: {text}");
+    assert!(text.contains("remote pi"), "frame: {text}");
+    assert_eq!(state.hits.agent_group_toggles.len(), 2);
+    assert_eq!(state.hits.endpoint_agents.len(), 3);
+}
+
+#[test]
+fn aggregate_agent_panel_toggle_collapses_machine_group_with_aggregate_severity() {
+    use crate::api::schema::AgentStatus;
+    use crate::config::StatusIndicatorStyle;
+
+    let mut config = Config::default();
+    config.ui.status_indicators = StatusIndicatorStyle::Symbols;
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    let profile = remote_profile();
+    let endpoint_id = ClientEndpointId::Ssh(profile.id.clone());
+    state.set_endpoint_catalog(&[profile]);
+    state.set_endpoint_status(&endpoint_id, ClientEndpointStatus::Online);
+
+    let mut local = snapshot();
+    local.agents = vec![
+        agent("pi one", AgentStatus::Working, 1),
+        ClientShellAgent {
+            agent_status: AgentStatus::Blocked,
+            state_change_seq: 2,
+            focused: false,
+            ..agent("pi two", AgentStatus::Blocked, 2)
+        },
+    ];
+    state.set_snapshot(Box::new(local));
+    state.set_pane_surface(surface());
+
+    let mut remote = snapshot();
+    remote.boot_id = "remote-boot".into();
+    remote.agents = vec![agent("remote pi", AgentStatus::Idle, 1)];
+    state.set_endpoint_snapshot(&endpoint_id, Box::new(remote));
+
+    state.compose(100, 32).expect("grouped aggregate frame");
+    let (header, _) = state
+        .hits
+        .agent_group_toggles
+        .iter()
+        .find(|(_, key)| key == "local")
+        .cloned()
+        .expect("local machine group toggle");
+    state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: header.x + 1,
+        row: header.y,
+        modifiers: KeyModifiers::NONE,
+    })]);
+
+    assert!(state.collapsed_agent_groups.contains("local"));
+    let frame = state.compose(100, 32).expect("collapsed aggregate frame");
+    let text = frame
+        .cells
+        .chunks(frame.width as usize)
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("▸ Local"), "frame: {text}");
+    assert!(!text.contains("pi one"), "frame: {text}");
+    assert!(!text.contains("pi two"), "frame: {text}");
+    assert!(text.contains("remote pi"), "frame: {text}");
+    assert_eq!(state.hits.endpoint_agents.len(), 1);
+    let buffer = frame.to_ratatui_buffer().expect("aggregate frame buffer");
+    let (x, y) = cell_symbol_position(&frame, header, "×");
+    let icon = buffer.cell((x, y)).expect("aggregate status cell");
+    assert_eq!(icon.symbol(), "×");
 }
 
 #[test]

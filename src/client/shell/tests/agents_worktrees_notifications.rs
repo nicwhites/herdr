@@ -1462,3 +1462,110 @@ fn semantic_notifications_use_client_policy_and_stable_navigation_targets() {
     assert!(state.visible_notification.is_none());
     assert_eq!(state.pending_notifications.len(), 1);
 }
+
+fn agent_panel_fixture() -> ClientShellState {
+    let mut projected = snapshot();
+    projected.panes[0].label = Some("editor".into());
+    projected.agents = vec![
+        ClientShellAgent {
+            pane_id: "pane_1".into(),
+            workspace_id: "ws_1".into(),
+            tab_id: "tab_1".into(),
+            name: Some("pi one".into()),
+            display_agent: None,
+            agent: Some("pi".into()),
+            title: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            agent_status: AgentStatus::Working,
+            state_change_seq: 1,
+            state_labels: Vec::new(),
+            tokens: Vec::new(),
+            focused: true,
+        },
+        ClientShellAgent {
+            pane_id: "pane_1".into(),
+            workspace_id: "ws_1".into(),
+            tab_id: "tab_1".into(),
+            name: Some("pi two".into()),
+            display_agent: None,
+            agent: Some("pi".into()),
+            title: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            agent_status: AgentStatus::Blocked,
+            state_change_seq: 2,
+            state_labels: Vec::new(),
+            tokens: Vec::new(),
+            focused: true,
+        },
+    ];
+    let mut config = Config::default();
+    config.ui.status_indicators = crate::config::StatusIndicatorStyle::Symbols;
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    state.set_snapshot(Box::new(projected));
+    state.set_pane_surface(surface());
+    state
+}
+
+fn frame_text(state: &mut ClientShellState) -> String {
+    let frame = state.compose(106, 30).expect("agent sidebar frame");
+    frame
+        .cells
+        .chunks(frame.width as usize)
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn click(state: &mut ClientShellState, point: (u16, u16)) -> ClientShellInput {
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: point.0,
+        row: point.1,
+        modifiers: KeyModifiers::empty(),
+    })])
+}
+
+#[test]
+fn aggregate_agent_status_ranks_blocked_over_done_over_working_over_idle() {
+    use super::super::agent_sidebar::aggregate_agent_status;
+    use crate::api::schema::AgentStatus;
+
+    assert_eq!(
+        aggregate_agent_status([AgentStatus::Done, AgentStatus::Blocked].into_iter()),
+        AgentStatus::Blocked
+    );
+    assert_eq!(
+        aggregate_agent_status([AgentStatus::Working, AgentStatus::Done].into_iter()),
+        AgentStatus::Done
+    );
+    assert_eq!(
+        aggregate_agent_status([AgentStatus::Idle, AgentStatus::Working].into_iter()),
+        AgentStatus::Working
+    );
+    assert_eq!(
+        aggregate_agent_status([AgentStatus::Unknown, AgentStatus::Idle].into_iter()),
+        AgentStatus::Idle
+    );
+}
+
+#[test]
+fn agent_panel_member_click_still_focuses_pane() {
+    let mut state = agent_panel_fixture();
+    frame_text(&mut state);
+    let row = state.hits.agents[0].0;
+    let click_actions = click(&mut state, (row.x, row.y));
+
+    let [ClientShellAction::Endpoint { request, .. }] = &click_actions.actions[..] else {
+        panic!("agent member click should focus through endpoint API");
+    };
+    assert!(matches!(
+        &request.method,
+        crate::api::schema::Method::PaneFocus(target) if target.pane_id == "pane_1"
+    ));
+}
